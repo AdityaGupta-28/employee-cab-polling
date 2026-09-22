@@ -1,0 +1,12 @@
+package com.cabpooling.employeecabpooling.repository;
+
+import com.cabpooling.employeecabpooling.model.entity.Office;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.Optional;
+
+@Repository
+public interface OfficeRepository extends JpaRepository<Office, Long> {
+    Optional<Office> findByName(String name);
+}
