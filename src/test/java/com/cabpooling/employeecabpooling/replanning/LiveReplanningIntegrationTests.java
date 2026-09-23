@@ -50,6 +50,7 @@ class LiveReplanningIntegrationTests {
     @Autowired private OfficeService officeService;
     @Autowired private ShiftService shiftService;
     @Autowired private CabService cabService;
+    @Autowired private com.cabpooling.employeecabpooling.repository.CabRepository cabRepository;
     @Autowired private AllocationService allocationService;
     @Autowired private CabAssignmentService cabAssignmentService;
 
@@ -98,6 +99,12 @@ class LiveReplanningIntegrationTests {
                 .startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0))
                 .shiftType(ShiftType.INBOUND).cutoffMinutes(0).build());
         shiftId = shift.getId();
+
+        // Deactivate pre-existing cabs to guarantee test isolation
+        cabRepository.findAll().forEach(c -> {
+            c.setIsActive(false);
+            cabRepository.save(c);
+        });
 
         // Cab with capacity 2
         cabService.create(CabRequest.builder()

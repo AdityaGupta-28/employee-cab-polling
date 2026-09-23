@@ -15,6 +15,7 @@ import java.util.Optional;
 public interface BookingRepository extends JpaRepository<Booking, Long> {
     Optional<Booking> findByEmployeeIdAndShiftIdAndBookingDate(Long employeeId, Long shiftId, LocalDate bookingDate);
     boolean existsByEmployeeIdAndShiftIdAndBookingDate(Long employeeId, Long shiftId, LocalDate bookingDate);
+    boolean existsByEmployeeIdAndShiftIdAndBookingDateAndStatus(Long employeeId, Long shiftId, LocalDate bookingDate, BookingStatus status);
     List<Booking> findByBookingDateAndShiftId(LocalDate bookingDate, Long shiftId);
     List<Booking> findByBookingDateAndShiftIdAndStatus(LocalDate bookingDate, Long shiftId, BookingStatus status);
     List<Booking> findByEmployeeId(Long employeeId);

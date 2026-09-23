@@ -39,11 +39,11 @@ public class BookingService {
         Employee employee = getCaller();
         Shift shift = getShiftOrThrow(request.getShiftId());
 
-        // Idempotency check
-        if (bookingRepository.existsByEmployeeIdAndShiftIdAndBookingDate(
-                employee.getId(), shift.getId(), request.getBookingDate())) {
+        // Idempotency check: prevent duplicate active bookings for the same shift and date
+        if (bookingRepository.existsByEmployeeIdAndShiftIdAndBookingDateAndStatus(
+                employee.getId(), shift.getId(), request.getBookingDate(), BookingStatus.CONFIRMED)) {
             throw new DuplicateResourceException(
-                    "You already have a booking for this shift on " + request.getBookingDate());
+                    "You already have an active booking for this shift on " + request.getBookingDate());
         }
 
         // Cutoff window check: reject if booking is too close to shift start time

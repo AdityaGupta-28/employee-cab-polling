@@ -43,6 +43,7 @@ public class AllocationService {
     private final DistanceProvider distanceProvider;
     private final TwoOptRouteOptimizer routeOptimizer;
     private final NightSafetyService nightSafetyService;
+    private final com.cabpooling.employeecabpooling.routing.validator.MaxRideTimeValidator maxRideTimeValidator;
 
     @Transactional
     public AutoClusterResponse autoCluster(AutoClusterRequest request) {
@@ -66,20 +67,22 @@ public class AllocationService {
                     .build();
         }
 
-        // Available active cabs (not already assigned to this shift and date)
-        List<Cab> activeCabs = cabRepository.findByIsActive(true);
-        List<CabAssignment> existingAssignments = cabAssignmentRepository.findByAssignmentDateAndShiftId(date, shift.getId());
-        List<Long> assignedCabIds = existingAssignments.stream().map(a -> a.getCab().getId()).toList();
-
-        List<Cab> availableCabs = activeCabs.stream()
-                .filter(c -> !assignedCabIds.contains(c.getId()))
-                .toList();
-
-        if (availableCabs.isEmpty()) {
-            throw new BusinessRuleException("No available active cabs found for shift on " + date);
+        // Delete any existing PLANNED assignments for this shift & date to re-cluster with new bookings
+        List<CabAssignment> existingPlanned = cabAssignmentRepository.findByAssignmentDateAndShiftId(date, shift.getId())
+                .stream().filter(a -> a.getStatus() == AssignmentStatus.PLANNED).toList();
+        if (!existingPlanned.isEmpty()) {
+            cabAssignmentRepository.deleteAll(existingPlanned);
+            cabAssignmentRepository.flush();
         }
 
-        // Spatial Greedy Clustering: Group bookings by proximity
+        // Available active cabs
+        List<Cab> availableCabs = cabRepository.findByIsActive(true);
+
+        if (availableCabs.isEmpty()) {
+            throw new BusinessRuleException("No active cabs found in fleet. Please activate cabs in Fleet management.");
+        }
+
+        // Spatial Greedy Clustering: Group bookings by proximity respecting cab capacity
         List<List<Booking>> clusters = clusterBookingsByProximity(confirmedBookings, availableCabs, office);
 
         List<CabAssignmentResponse> createdAssignmentResponses = new ArrayList<>();
@@ -91,6 +94,14 @@ public class AllocationService {
             }
 
             Cab cab = availableCabs.get(cabIdx++);
+
+            // Hard Rule 1: Seat Capacity Constraint Check
+            if (clusterBookings.size() > cab.getCapacity()) {
+                throw new BusinessRuleException(String.format(
+                        "Seat capacity constraint violated: Cab %s capacity is %d, but %d passengers were assigned",
+                        cab.getLicensePlate(), cab.getCapacity(), clusterBookings.size()));
+            }
+
             CabAssignment assignment = CabAssignment.builder()
                     .cab(cab)
                     .shift(shift)
@@ -105,6 +116,9 @@ public class AllocationService {
             // Optimize route using 2-Opt and distance provider
             OptimizedRouteResult routeResult = routeOptimizer.optimizeRoute(
                     office, clusterBookings, shift.getShiftType(), distanceProvider);
+
+            // Hard Rule 2: Max-Ride-Time Validation (90 minutes limit)
+            maxRideTimeValidator.validateRoute(routeResult, shift.getShiftType());
 
             applyStopsToAssignment(assignment, routeResult, shift, date);
             assignment.setTotalDistanceKm(routeResult.getTotalDistanceKm());
@@ -218,9 +232,11 @@ public class AllocationService {
             clusters.add(currentCluster);
         }
 
-        // If bookings still remain but cabs ran out, place into last cluster or log warning
-        if (!pool.isEmpty() && !clusters.isEmpty()) {
-            clusters.get(clusters.size() - 1).addAll(pool);
+        // Hard Rule: If bookings remain but cabs ran out, log a warning and leave them unassigned.
+        // Never silently overflow extra bookings into the last cluster - that violates seat capacity!
+        if (!pool.isEmpty()) {
+            log.warn("Seat capacity constraint: {} bookings could not be assigned — no available cabs with free seats. " +
+                    "Add more cabs or activate existing fleet cabs.", pool.size());
         }
 
         return clusters;

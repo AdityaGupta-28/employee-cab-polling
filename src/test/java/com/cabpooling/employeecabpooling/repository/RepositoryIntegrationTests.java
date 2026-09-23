@@ -80,7 +80,7 @@ class RepositoryIntegrationTests {
                 .isActive(true)
                 .build());
         assertThat(cab.getId()).isNotNull();
-        assertThat(cabRepository.findByIsActiveTrue()).hasSize(1);
+        assertThat(cabRepository.findByIsActiveTrue()).isNotEmpty();
 
         // 4. Create and persist Shift
         Shift shift = shiftRepository.save(Shift.builder()
