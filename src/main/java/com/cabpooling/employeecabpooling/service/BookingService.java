@@ -32,6 +32,7 @@ public class BookingService {
     private final BookingRepository bookingRepository;
     private final EmployeeRepository employeeRepository;
     private final ShiftRepository shiftRepository;
+    private final ReplanningService replanningService;
 
     @Transactional
     public BookingResponse create(BookingRequest request) {
@@ -95,7 +96,12 @@ public class BookingService {
         }
 
         booking.setStatus(BookingStatus.CANCELLED);
-        return toResponse(bookingRepository.save(booking));
+        Booking saved = bookingRepository.save(booking);
+
+        // Live Dynamic Replanning: re-route affected cab assignment if assigned
+        replanningService.handleCancellation(id);
+
+        return toResponse(saved);
     }
 
     @Transactional(readOnly = true)

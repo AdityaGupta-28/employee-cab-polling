@@ -17,6 +17,7 @@ import org.springframework.web.bind.annotation.*;
 public class AllocationController {
 
     private final AllocationService allocationService;
+    private final com.cabpooling.employeecabpooling.service.ReplanningService replanningService;
 
     @PostMapping("/auto-cluster")
     @PreAuthorize("hasAuthority('ROLE_ADMIN')")
@@ -31,6 +32,15 @@ public class AllocationController {
     public ResponseEntity<CabAssignmentResponse> optimizeAssignment(
             @PathVariable Long cabAssignmentId) {
         CabAssignmentResponse response = allocationService.optimizeAssignment(cabAssignmentId);
+        return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/insert-booking/{bookingId}")
+    @PreAuthorize("hasAuthority('ROLE_ADMIN')")
+    public ResponseEntity<com.cabpooling.employeecabpooling.dto.replanning.LateBookingInsertResponse> insertLateBooking(
+            @PathVariable Long bookingId) {
+        com.cabpooling.employeecabpooling.dto.replanning.LateBookingInsertResponse response =
+                replanningService.insertLateBooking(bookingId);
         return ResponseEntity.ok(response);
     }
 }
