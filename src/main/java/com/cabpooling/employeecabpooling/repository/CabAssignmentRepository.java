@@ -13,4 +13,7 @@ public interface CabAssignmentRepository extends JpaRepository<CabAssignment, Lo
     List<CabAssignment> findByAssignmentDateAndShiftId(LocalDate assignmentDate, Long shiftId);
     List<CabAssignment> findByAssignmentDateAndStatus(LocalDate assignmentDate, AssignmentStatus status);
     List<CabAssignment> findByCabIdAndAssignmentDate(Long cabId, LocalDate assignmentDate);
+    List<CabAssignment> findByAssignmentDate(LocalDate assignmentDate);
+    List<CabAssignment> findByShiftId(Long shiftId);
+    boolean existsByCabIdAndShiftIdAndAssignmentDate(Long cabId, Long shiftId, LocalDate assignmentDate);
 }
