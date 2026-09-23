@@ -12,5 +12,6 @@ public interface CabRepository extends JpaRepository<Cab, Long> {
     Optional<Cab> findByLicensePlate(String licensePlate);
     boolean existsByLicensePlate(String licensePlate);
     List<Cab> findByIsActiveTrue();
+    List<Cab> findByIsActive(Boolean isActive);
     List<Cab> findByIsActiveTrueAndCapacityGreaterThanEqual(Integer capacity);
 }

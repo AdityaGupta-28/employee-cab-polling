@@ -33,5 +33,6 @@ public class ShiftRequest {
     private ShiftType shiftType;
 
     @Min(value = 0, message = "Cutoff minutes must be 0 or greater")
+    @Builder.Default
     private int cutoffMinutes = 120;
 }

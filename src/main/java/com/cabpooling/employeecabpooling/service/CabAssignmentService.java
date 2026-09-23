@@ -139,8 +139,9 @@ public class CabAssignmentService {
                 date, shift.getId(), BookingStatus.CONFIRMED);
 
         // Clear existing stops
+        pickupStopRepository.deleteByCabAssignmentId(assignment.getId());
+        pickupStopRepository.flush();
         assignment.getStops().clear();
-        cabAssignmentRepository.saveAndFlush(assignment);
 
         if (confirmedBookings.isEmpty()) {
             assignment.setTotalDistanceKm(0.0);

@@ -11,4 +11,5 @@ import java.util.Optional;
 public interface PickupStopRepository extends JpaRepository<PickupStop, Long> {
     List<PickupStop> findByCabAssignmentIdOrderByStopOrderAsc(Long cabAssignmentId);
     Optional<PickupStop> findByBookingId(Long bookingId);
+    void deleteByCabAssignmentId(Long cabAssignmentId);
 }
