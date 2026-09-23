@@ -33,6 +33,7 @@ public class BookingService {
     private final EmployeeRepository employeeRepository;
     private final ShiftRepository shiftRepository;
     private final ReplanningService replanningService;
+    private final AllocationService allocationService;
 
     @Transactional
     public BookingResponse create(BookingRequest request) {
@@ -59,7 +60,25 @@ public class BookingService {
                 .status(BookingStatus.CONFIRMED)
                 .build();
 
-        return toResponse(bookingRepository.save(booking));
+        Booking saved = bookingRepository.save(booking);
+
+        // Auto-allocate new booking into cab route so it immediately appears in route map
+        try {
+            replanningService.insertLateBooking(saved.getId());
+        } catch (Exception e) {
+            try {
+                allocationService.autoCluster(
+                        com.cabpooling.employeecabpooling.dto.allocation.AutoClusterRequest.builder()
+                                .shiftId(shift.getId())
+                                .assignmentDate(request.getBookingDate())
+                                .build()
+                );
+            } catch (Exception ex) {
+                // Log and keep booking confirmed if no cabs are active
+            }
+        }
+
+        return toResponse(saved);
     }
 
     @Transactional(readOnly = true)
