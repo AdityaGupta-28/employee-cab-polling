@@ -2,6 +2,8 @@ package com.cabpooling.employeecabpooling.repository;
 
 import com.cabpooling.employeecabpooling.model.entity.Booking;
 import com.cabpooling.employeecabpooling.model.enums.BookingStatus;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
 
@@ -17,4 +19,8 @@ public interface BookingRepository extends JpaRepository<Booking, Long> {
     List<Booking> findByBookingDateAndShiftIdAndStatus(LocalDate bookingDate, Long shiftId, BookingStatus status);
     List<Booking> findByEmployeeId(Long employeeId);
     List<Booking> findByEmployeeIdAndBookingDate(Long employeeId, LocalDate bookingDate);
+    // Paginated variants used by BookingService
+    Page<Booking> findByEmployeeId(Long employeeId, Pageable pageable);
+    Page<Booking> findByEmployeeIdAndBookingDate(Long employeeId, LocalDate bookingDate, Pageable pageable);
 }
+
