@@ -1,31 +1,31 @@
 package com.cabpooling.employeecabpooling.service;
 
+import com.cabpooling.employeecabpooling.config.RoutingProperties;
 import com.cabpooling.employeecabpooling.dto.assignment.CabAssignmentResponse;
-import com.cabpooling.employeecabpooling.dto.assignment.PickupStopResponse;
 import com.cabpooling.employeecabpooling.dto.replanning.LateBookingInsertResponse;
 import com.cabpooling.employeecabpooling.exception.BusinessRuleException;
 import com.cabpooling.employeecabpooling.exception.ResourceNotFoundException;
 import com.cabpooling.employeecabpooling.model.entity.Booking;
 import com.cabpooling.employeecabpooling.model.entity.CabAssignment;
+import com.cabpooling.employeecabpooling.model.entity.Office;
 import com.cabpooling.employeecabpooling.model.entity.PickupStop;
 import com.cabpooling.employeecabpooling.model.entity.Shift;
 import com.cabpooling.employeecabpooling.model.enums.AssignmentStatus;
 import com.cabpooling.employeecabpooling.model.enums.BookingStatus;
-import com.cabpooling.employeecabpooling.model.enums.ShiftType;
-import com.cabpooling.employeecabpooling.model.enums.StopType;
 import com.cabpooling.employeecabpooling.repository.BookingRepository;
 import com.cabpooling.employeecabpooling.repository.CabAssignmentRepository;
 import com.cabpooling.employeecabpooling.repository.EscortAssignmentRepository;
 import com.cabpooling.employeecabpooling.repository.PickupStopRepository;
 import com.cabpooling.employeecabpooling.routing.DistanceProvider;
-import com.cabpooling.employeecabpooling.routing.DistanceResult;
+import com.cabpooling.employeecabpooling.routing.optimizer.TwoOptRouteOptimizer;
+import com.cabpooling.employeecabpooling.routing.optimizer.TwoOptRouteOptimizer.OptimizedRouteResult;
+import com.cabpooling.employeecabpooling.routing.validator.MaxRideTimeValidator;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDate;
-import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -41,14 +41,16 @@ public class ReplanningService {
     private final EscortAssignmentRepository escortAssignmentRepository;
     private final DistanceProvider distanceProvider;
     private final NightSafetyService nightSafetyService;
-
-    private static final double MAX_DETOUR_KM_THRESHOLD = 30.0;
+    private final TwoOptRouteOptimizer routeOptimizer;
+    private final MaxRideTimeValidator maxRideTimeValidator;
+    private final AllocationService allocationService;
+    private final RoutingProperties routingProperties;
 
     @Transactional
     public CabAssignmentResponse handleCancellation(Long bookingId) {
         Optional<PickupStop> stopOpt = pickupStopRepository.findByBookingId(bookingId);
         if (stopOpt.isEmpty()) {
-            return null; // Booking was not yet assigned to any cab
+            return null;
         }
 
         PickupStop stopToRemove = stopOpt.get();
@@ -56,21 +58,14 @@ public class ReplanningService {
 
         log.info("Handling cancellation of booking id={} from cab assignment id={}", bookingId, assignment.getId());
 
-        // Build target stop list from remaining stops
-        List<StopData> targetStops = new ArrayList<>();
+        List<Booking> remaining = new ArrayList<>();
         for (PickupStop s : assignment.getStops()) {
-            if (!s.getId().equals(stopToRemove.getId())) {
-                targetStops.add(new StopData(s.getStopType(), s.getBooking(), s.getAddress(),
-                        s.getLatitude(), s.getLongitude()));
+            if (s.getBooking() != null && !s.getBooking().getId().equals(bookingId)) {
+                remaining.add(s.getBooking());
             }
         }
 
-        long passengerCount = targetStops.stream()
-                .filter(s -> s.booking != null)
-                .count();
-
-        if (passengerCount == 0) {
-            // No remaining passengers
+        if (remaining.isEmpty()) {
             assignment.getStops().clear();
             assignment.setTotalDistanceKm(0.0);
             assignment.setTotalDurationMinutes(0);
@@ -80,18 +75,17 @@ public class ReplanningService {
                 assignment.setHasEscort(false);
             }
             CabAssignment saved = cabAssignmentRepository.save(assignment);
-            return mapToResponse(saved);
+            return allocationService.mapToResponse(saved);
         }
 
-        // In-place update route metrics with remaining stops
-        applyTargetStops(assignment, targetStops);
+        // Local replan only — 2-opt on this cab; untouched assignments are never reshuffled
+        reoptimizeAssignment(assignment, remaining);
         CabAssignment saved = cabAssignmentRepository.save(assignment);
-
-        // Re-evaluate night safety rules (e.g. if sole passenger is now female)
         nightSafetyService.evaluateAndProtect(saved);
         saved = cabAssignmentRepository.save(saved);
+        maxRideTimeValidator.validateAssignment(saved, routingProperties.getMaxRideMinutes());
 
-        return mapToResponse(saved);
+        return allocationService.mapToResponse(saved);
     }
 
     @Transactional
@@ -109,6 +103,8 @@ public class ReplanningService {
 
         LocalDate date = booking.getBookingDate();
         Shift shift = booking.getShift();
+        Office office = shift.getOffice();
+        double maxDetourKm = routingProperties.getMaxDetourKm();
 
         List<CabAssignment> candidateAssignments = cabAssignmentRepository
                 .findByAssignmentDateAndShiftId(date, shift.getId()).stream()
@@ -120,8 +116,9 @@ public class ReplanningService {
         }
 
         CabAssignment bestAssignment = null;
-        int bestInsertIdx = -1;
+        OptimizedRouteResult bestRoute = null;
         double minDetour = Double.MAX_VALUE;
+        int bestInsertOrder = 1;
 
         for (CabAssignment candidate : candidateAssignments) {
             long currentPassengers = candidate.getStops().stream()
@@ -129,239 +126,125 @@ public class ReplanningService {
                     .count();
 
             if (currentPassengers >= candidate.getCab().getCapacity()) {
-                continue; // Cab is full
+                continue;
             }
 
-            List<PickupStop> stops = candidate.getStops();
-            if (stops.isEmpty()) {
-                // Empty assignment
-                bestAssignment = candidate;
-                bestInsertIdx = 0;
-                minDetour = 0.0;
-                break;
+            List<Booking> proposed = new ArrayList<>();
+            for (PickupStop s : candidate.getStops()) {
+                if (s.getBooking() != null) {
+                    proposed.add(s.getBooking());
+                }
+            }
+            proposed.add(booking);
+
+            double detour = estimateDetourKm(candidate, booking);
+            if (detour > maxDetourKm) {
+                continue;
             }
 
-            // Find best insertion index
-            int minIdx = (shift.getShiftType() == ShiftType.OUTBOUND) ? 1 : 0;
-            int maxIdx = (shift.getShiftType() == ShiftType.INBOUND) ? stops.size() - 1 : stops.size();
+            try {
+                OptimizedRouteResult routeResult = routeOptimizer.optimizeRoute(
+                        office, proposed, shift.getShiftType(), distanceProvider);
+                maxRideTimeValidator.validateRoute(routeResult, shift.getShiftType(),
+                        routingProperties.getMaxRideMinutes());
 
-            for (int k = minIdx; k <= maxIdx; k++) {
-                double detour = computeInsertionDetour(stops, k, booking.getPickupLatitude(), booking.getPickupLongitude());
                 if (detour < minDetour) {
                     minDetour = detour;
                     bestAssignment = candidate;
-                    bestInsertIdx = k;
+                    bestRoute = routeResult;
+                    bestInsertOrder = indexOfBookingInRoute(routeResult, booking.getId());
                 }
+            } catch (BusinessRuleException ex) {
+                log.debug("Late insert into assignment {} rejected: {}", candidate.getId(), ex.getMessage());
             }
         }
 
-        if (bestAssignment == null || minDetour > MAX_DETOUR_KM_THRESHOLD) {
-            throw new BusinessRuleException("No suitable cab found with capacity and acceptable detour for late booking");
+        if (bestAssignment == null || bestRoute == null) {
+            throw new BusinessRuleException(
+                    "No suitable cab found with free seat, acceptable detour, and max-ride compliance for late booking");
         }
 
-        // Build target stop list in new order
-        List<PickupStop> existingStops = bestAssignment.getStops();
-        StopType stopType = (shift.getShiftType() == ShiftType.INBOUND) ? StopType.PICKUP : StopType.DROPOFF;
-
-        List<StopData> targetStops = new ArrayList<>();
-        for (int i = 0; i < existingStops.size(); i++) {
-            if (i == bestInsertIdx) {
-                targetStops.add(new StopData(stopType, booking, booking.getPickupAddress(),
-                        booking.getPickupLatitude(), booking.getPickupLongitude()));
-            }
-            PickupStop s = existingStops.get(i);
-            targetStops.add(new StopData(s.getStopType(), s.getBooking(), s.getAddress(),
-                    s.getLatitude(), s.getLongitude()));
-        }
-        if (bestInsertIdx == existingStops.size()) {
-            targetStops.add(new StopData(stopType, booking, booking.getPickupAddress(),
-                    booking.getPickupLatitude(), booking.getPickupLongitude()));
-        }
-
-        applyTargetStops(bestAssignment, targetStops);
+        allocationService.applyStopsToAssignment(bestAssignment, bestRoute, shift, date);
+        bestAssignment.setTotalDistanceKm(bestRoute.getTotalDistanceKm());
+        bestAssignment.setTotalDurationMinutes(bestRoute.getTotalDurationMinutes());
         bestAssignment = cabAssignmentRepository.save(bestAssignment);
 
         nightSafetyService.evaluateAndProtect(bestAssignment);
         bestAssignment = cabAssignmentRepository.save(bestAssignment);
+        maxRideTimeValidator.validateAssignment(bestAssignment, routingProperties.getMaxRideMinutes());
 
-        log.info("Inserted late booking id={} into cab assignment id={} at index {} with detour {}km",
-                bookingId, bestAssignment.getId(), bestInsertIdx + 1, Math.round(minDetour * 100.0) / 100.0);
+        log.info("Inserted late booking id={} into cab assignment id={} (order {}) with detour {}km",
+                bookingId, bestAssignment.getId(), bestInsertOrder, Math.round(minDetour * 100.0) / 100.0);
 
         return LateBookingInsertResponse.builder()
                 .bookingId(booking.getId())
                 .cabAssignmentId(bestAssignment.getId())
                 .cabId(bestAssignment.getCab().getId())
                 .cabLicensePlate(bestAssignment.getCab().getLicensePlate())
-                .insertedAtStopOrder(bestInsertIdx + 1)
+                .insertedAtStopOrder(bestInsertOrder)
                 .detourKm(Math.round(minDetour * 100.0) / 100.0)
-                .assignment(mapToResponse(bestAssignment))
+                .assignment(allocationService.mapToResponse(bestAssignment))
                 .build();
+    }
+
+    private void reoptimizeAssignment(CabAssignment assignment, List<Booking> bookings) {
+        Shift shift = assignment.getShift();
+        Office office = shift.getOffice();
+        OptimizedRouteResult routeResult = routeOptimizer.optimizeRoute(
+                office, bookings, shift.getShiftType(), distanceProvider);
+        maxRideTimeValidator.validateRoute(routeResult, shift.getShiftType(),
+                routingProperties.getMaxRideMinutes());
+        allocationService.applyStopsToAssignment(assignment, routeResult, shift, assignment.getAssignmentDate());
+        assignment.setTotalDistanceKm(routeResult.getTotalDistanceKm());
+        assignment.setTotalDurationMinutes(routeResult.getTotalDurationMinutes());
+    }
+
+    private double estimateDetourKm(CabAssignment candidate, Booking booking) {
+        List<PickupStop> stops = candidate.getStops();
+        if (stops.isEmpty()) {
+            return 0.0;
+        }
+
+        double minDetour = Double.MAX_VALUE;
+        for (int k = 0; k <= stops.size(); k++) {
+            double detour = computeInsertionDetour(stops, k, booking.getPickupLatitude(), booking.getPickupLongitude());
+            if (detour < minDetour) {
+                minDetour = detour;
+            }
+        }
+        return minDetour;
     }
 
     private double computeInsertionDetour(List<PickupStop> stops, int insertIdx, double newLat, double newLon) {
         if (stops.isEmpty()) {
             return 0.0;
         }
-
         if (insertIdx == 0) {
             PickupStop next = stops.get(0);
             return distanceProvider.calculateDistanceKm(newLat, newLon, next.getLatitude(), next.getLongitude());
         }
-
         if (insertIdx == stops.size()) {
             PickupStop prev = stops.get(stops.size() - 1);
             return distanceProvider.calculateDistanceKm(prev.getLatitude(), prev.getLongitude(), newLat, newLon);
         }
-
         PickupStop prev = stops.get(insertIdx - 1);
         PickupStop next = stops.get(insertIdx);
-
         double originalLeg = distanceProvider.calculateDistanceKm(
                 prev.getLatitude(), prev.getLongitude(), next.getLatitude(), next.getLongitude());
         double newLeg1 = distanceProvider.calculateDistanceKm(
                 prev.getLatitude(), prev.getLongitude(), newLat, newLon);
         double newLeg2 = distanceProvider.calculateDistanceKm(
                 newLat, newLon, next.getLatitude(), next.getLongitude());
-
         return (newLeg1 + newLeg2) - originalLeg;
     }
 
-    private void applyTargetStops(CabAssignment assignment, List<StopData> targetStops) {
-        List<PickupStop> existingStops = assignment.getStops();
-        Shift shift = assignment.getShift();
-        LocalDate date = assignment.getAssignmentDate();
-        OffsetDateTime now = OffsetDateTime.now();
-
-        double totalDist = 0.0;
-        int totalDur = 0;
-        double[] legDistances = new double[targetStops.size()];
-        int[] legDurations = new int[targetStops.size()];
-
-        for (int i = 0; i < targetStops.size(); i++) {
-            if (i == 0) {
-                legDistances[i] = 0.0;
-                legDurations[i] = 0;
-            } else {
-                StopData prev = targetStops.get(i - 1);
-                StopData curr = targetStops.get(i);
-                DistanceResult r = distanceProvider.calculateDistanceAndDuration(
-                        prev.lat, prev.lon, curr.lat, curr.lon);
-                legDistances[i] = r.getDistanceKm();
-                legDurations[i] = r.getDurationMinutes();
-                totalDist += r.getDistanceKm();
-                totalDur += r.getDurationMinutes();
+    private int indexOfBookingInRoute(OptimizedRouteResult route, Long bookingId) {
+        List<TwoOptRouteOptimizer.OptimizedStop> stops = route.getStops();
+        for (int i = 0; i < stops.size(); i++) {
+            if (stops.get(i).getBooking() != null && bookingId.equals(stops.get(i).getBooking().getId())) {
+                return i + 1;
             }
         }
-
-        // Planned times
-        OffsetDateTime[] plannedTimes = new OffsetDateTime[targetStops.size()];
-        if (shift.getShiftType() == ShiftType.INBOUND) {
-            OffsetDateTime officeArrival = date.atTime(shift.getStartTime()).atOffset(now.getOffset());
-            OffsetDateTime current = officeArrival.minusMinutes(totalDur);
-            for (int i = 0; i < targetStops.size(); i++) {
-                if (i > 0) {
-                    current = current.plusMinutes(legDurations[i]);
-                }
-                plannedTimes[i] = current;
-            }
-            if (!targetStops.isEmpty()) {
-                plannedTimes[targetStops.size() - 1] = officeArrival;
-            }
-        } else {
-            OffsetDateTime officeDeparture = date.atTime(shift.getEndTime()).atOffset(now.getOffset());
-            OffsetDateTime current = officeDeparture;
-            for (int i = 0; i < targetStops.size(); i++) {
-                if (i > 0) {
-                    current = current.plusMinutes(legDurations[i]);
-                }
-                plannedTimes[i] = current;
-            }
-        }
-
-        // In-place update existing elements or append new ones
-        for (int i = 0; i < targetStops.size(); i++) {
-            StopData target = targetStops.get(i);
-            if (i < existingStops.size()) {
-                PickupStop existing = existingStops.get(i);
-                existing.setBooking(target.booking);
-                existing.setStopOrder(i + 1);
-                existing.setStopType(target.type);
-                existing.setLatitude(target.lat);
-                existing.setLongitude(target.lon);
-                existing.setAddress(target.address);
-                existing.setDistanceFromPreviousKm(legDistances[i]);
-                existing.setDurationFromPreviousMinutes(legDurations[i]);
-                existing.setPlannedTime(plannedTimes[i]);
-            } else {
-                PickupStop newStop = PickupStop.builder()
-                        .cabAssignment(assignment)
-                        .booking(target.booking)
-                        .stopOrder(i + 1)
-                        .stopType(target.type)
-                        .latitude(target.lat)
-                        .longitude(target.lon)
-                        .address(target.address)
-                        .distanceFromPreviousKm(legDistances[i])
-                        .durationFromPreviousMinutes(legDurations[i])
-                        .plannedTime(plannedTimes[i])
-                        .build();
-                existingStops.add(newStop);
-            }
-        }
-
-        while (existingStops.size() > targetStops.size()) {
-            existingStops.remove(existingStops.size() - 1);
-        }
-
-        assignment.setTotalDistanceKm(Math.round(totalDist * 100.0) / 100.0);
-        assignment.setTotalDurationMinutes(totalDur);
-    }
-
-    private record StopData(
-            StopType type,
-            Booking booking,
-            String address,
-            double lat,
-            double lon
-    ) {}
-
-    private CabAssignmentResponse mapToResponse(CabAssignment assignment) {
-        List<PickupStopResponse> stopResponses = assignment.getStops() != null
-                ? assignment.getStops().stream().map(this::mapStopToResponse).toList()
-                : List.of();
-
-        return CabAssignmentResponse.builder()
-                .id(assignment.getId())
-                .cabId(assignment.getCab() != null ? assignment.getCab().getId() : null)
-                .cabLicensePlate(assignment.getCab() != null ? assignment.getCab().getLicensePlate() : null)
-                .shiftId(assignment.getShift() != null ? assignment.getShift().getId() : null)
-                .shiftName(assignment.getShift() != null ? assignment.getShift().getName() : null)
-                .assignmentDate(assignment.getAssignmentDate())
-                .status(assignment.getStatus())
-                .totalDistanceKm(assignment.getTotalDistanceKm())
-                .totalDurationMinutes(assignment.getTotalDurationMinutes())
-                .hasEscort(assignment.getHasEscort())
-                .stops(stopResponses)
-                .createdAt(assignment.getCreatedAt())
-                .updatedAt(assignment.getUpdatedAt())
-                .build();
-    }
-
-    private PickupStopResponse mapStopToResponse(PickupStop stop) {
-        return PickupStopResponse.builder()
-                .id(stop.getId())
-                .stopOrder(stop.getStopOrder())
-                .stopType(stop.getStopType())
-                .address(stop.getAddress())
-                .latitude(stop.getLatitude())
-                .longitude(stop.getLongitude())
-                .plannedTime(stop.getPlannedTime())
-                .actualTime(stop.getActualTime())
-                .distanceFromPreviousKm(stop.getDistanceFromPreviousKm())
-                .durationFromPreviousMinutes(stop.getDurationFromPreviousMinutes())
-                .bookingId(stop.getBooking() != null ? stop.getBooking().getId() : null)
-                .employeeName(stop.getBooking() != null && stop.getBooking().getEmployee() != null
-                        ? stop.getBooking().getEmployee().getName() : null)
-                .build();
+        return 1;
     }
 }

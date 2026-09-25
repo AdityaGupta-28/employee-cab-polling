@@ -23,7 +23,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.time.LocalTime;
+import java.util.Optional;
 
 @Service
 @RequiredArgsConstructor
@@ -39,14 +39,25 @@ public class BookingService {
         Employee employee = getCaller();
         Shift shift = getShiftOrThrow(request.getShiftId());
 
-        // Idempotency check: prevent duplicate active bookings for the same shift and date
-        if (bookingRepository.existsByEmployeeIdAndShiftIdAndBookingDateAndStatus(
-                employee.getId(), shift.getId(), request.getBookingDate(), BookingStatus.CONFIRMED)) {
-            throw new DuplicateResourceException(
-                    "You already have an active booking for this shift on " + request.getBookingDate());
+        // Idempotency: same employee + shift + date must never occupy two seats
+        Optional<Booking> existing = bookingRepository.findByEmployeeIdAndShiftIdAndBookingDate(
+                employee.getId(), shift.getId(), request.getBookingDate());
+
+        if (existing.isPresent()) {
+            Booking prior = existing.get();
+            if (prior.getStatus() == BookingStatus.CONFIRMED) {
+                throw new DuplicateResourceException(
+                        "You already have an active booking for this shift on " + request.getBookingDate());
+            }
+            // Reactivate a previously cancelled booking instead of inserting a duplicate row
+            validateBookingWindow(shift, request.getBookingDate());
+            prior.setStatus(BookingStatus.CONFIRMED);
+            prior.setPickupLatitude(request.getPickupLatitude());
+            prior.setPickupLongitude(request.getPickupLongitude());
+            prior.setPickupAddress(request.getPickupAddress());
+            return toResponse(bookingRepository.save(prior));
         }
 
-        // Cutoff window check: reject if booking is too close to shift start time
         validateBookingWindow(shift, request.getBookingDate());
 
         Booking booking = Booking.builder()
@@ -98,7 +109,7 @@ public class BookingService {
         booking.setStatus(BookingStatus.CANCELLED);
         Booking saved = bookingRepository.save(booking);
 
-        // Live Dynamic Replanning: re-route affected cab assignment if assigned
+        // Live Dynamic Replanning: re-route affected cab only — other cabs untouched
         replanningService.handleCancellation(id);
 
         return toResponse(saved);
@@ -108,10 +119,6 @@ public class BookingService {
     public Page<BookingResponse> findAll(Pageable pageable) {
         return bookingRepository.findAll(pageable).map(this::toResponse);
     }
-
-    // -------------------------------------------------------------------------
-    // Business Rule: cutoff window
-    // -------------------------------------------------------------------------
 
     private void validateBookingWindow(Shift shift, LocalDate bookingDate) {
         LocalDateTime shiftStart = LocalDateTime.of(bookingDate, shift.getStartTime());
@@ -124,10 +131,6 @@ public class BookingService {
                             + shift.getStartTime() + " on " + bookingDate);
         }
     }
-
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
 
     private Booking getOrThrow(Long id) {
         return bookingRepository.findById(id)

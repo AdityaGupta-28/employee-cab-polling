@@ -1,5 +1,6 @@
 package com.cabpooling.employeecabpooling.dto.cab;
 
+import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -22,7 +23,8 @@ public class CabRequest {
     private String model;
 
     @NotNull(message = "Capacity is required")
-    @Min(value = 1, message = "Capacity must be at least 1")
+    @Min(value = 4, message = "Capacity must be 4 or 6")
+    @Max(value = 6, message = "Capacity must be 4 or 6")
     private Integer capacity;
 
     @NotBlank(message = "Driver name is required")

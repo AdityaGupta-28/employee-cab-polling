@@ -5,6 +5,7 @@ import com.cabpooling.employeecabpooling.model.enums.Role;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -34,6 +35,7 @@ public class RegisterRequest {
     private Gender gender;
 
     @NotBlank(message = "Phone number is required")
+    @Pattern(regexp = "^\\+?[0-9]{7,15}$", message = "Invalid phone number format")
     private String phoneNumber;
 
     @NotBlank(message = "Home address is required")

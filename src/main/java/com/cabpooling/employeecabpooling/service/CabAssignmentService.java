@@ -1,5 +1,6 @@
 package com.cabpooling.employeecabpooling.service;
 
+import com.cabpooling.employeecabpooling.config.RoutingProperties;
 import com.cabpooling.employeecabpooling.dto.assignment.AssignmentStatusRequest;
 import com.cabpooling.employeecabpooling.dto.assignment.CabAssignmentRequest;
 import com.cabpooling.employeecabpooling.dto.assignment.CabAssignmentResponse;
@@ -10,17 +11,23 @@ import com.cabpooling.employeecabpooling.exception.ResourceNotFoundException;
 import com.cabpooling.employeecabpooling.model.entity.*;
 import com.cabpooling.employeecabpooling.model.enums.AssignmentStatus;
 import com.cabpooling.employeecabpooling.model.enums.BookingStatus;
-import com.cabpooling.employeecabpooling.model.enums.ShiftType;
-import com.cabpooling.employeecabpooling.model.enums.StopType;
+import com.cabpooling.employeecabpooling.model.enums.Role;
 import com.cabpooling.employeecabpooling.repository.*;
+import com.cabpooling.employeecabpooling.routing.DistanceProvider;
+import com.cabpooling.employeecabpooling.routing.optimizer.TwoOptRouteOptimizer;
+import com.cabpooling.employeecabpooling.routing.optimizer.TwoOptRouteOptimizer.OptimizedRouteResult;
+import com.cabpooling.employeecabpooling.routing.validator.MaxRideTimeValidator;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDate;
-import java.time.OffsetDateTime;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
 @Slf4j
 @Service
@@ -31,7 +38,13 @@ public class CabAssignmentService {
     private final CabRepository cabRepository;
     private final ShiftRepository shiftRepository;
     private final BookingRepository bookingRepository;
-    private final PickupStopRepository pickupStopRepository;
+    private final EmployeeRepository employeeRepository;
+    private final AllocationService allocationService;
+    private final TwoOptRouteOptimizer routeOptimizer;
+    private final DistanceProvider distanceProvider;
+    private final MaxRideTimeValidator maxRideTimeValidator;
+    private final NightSafetyService nightSafetyService;
+    private final RoutingProperties routingProperties;
 
     @Transactional
     public CabAssignmentResponse create(CabAssignmentRequest request) {
@@ -81,10 +94,45 @@ public class CabAssignmentService {
         return assignments.stream().map(this::mapToResponse).toList();
     }
 
+    /**
+     * Employee-facing: return cab assignments where the caller has a pickup/dropoff stop,
+     * including planned pickup ETAs.
+     */
+    @Transactional(readOnly = true)
+    public List<CabAssignmentResponse> findMyAssignments(LocalDate date) {
+        Employee caller = getCaller();
+        List<CabAssignment> all = (date != null)
+                ? cabAssignmentRepository.findByAssignmentDate(date)
+                : cabAssignmentRepository.findAll();
+
+        return all.stream()
+                .filter(a -> a.getStops() != null && a.getStops().stream()
+                        .anyMatch(s -> s.getBooking() != null
+                                && s.getBooking().getEmployee() != null
+                                && s.getBooking().getEmployee().getId().equals(caller.getId())))
+                .map(this::mapToResponse)
+                .toList();
+    }
+
     @Transactional(readOnly = true)
     public CabAssignmentResponse findById(Long id) {
         CabAssignment assignment = cabAssignmentRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Cab assignment not found with id: " + id));
+
+        var authentication = SecurityContextHolder.getContext().getAuthentication();
+        if (authentication != null && authentication.isAuthenticated()
+                && !"anonymousUser".equals(authentication.getPrincipal())) {
+            Employee caller = getCaller();
+            if (!Role.ROLE_ADMIN.equals(caller.getRole())) {
+                boolean ownsStop = assignment.getStops() != null && assignment.getStops().stream()
+                        .anyMatch(s -> s.getBooking() != null
+                                && s.getBooking().getEmployee() != null
+                                && s.getBooking().getEmployee().getId().equals(caller.getId()));
+                if (!ownsStop) {
+                    throw new ResourceNotFoundException("Cab assignment not found with id: " + id);
+                }
+            }
+        }
         return mapToResponse(assignment);
     }
 
@@ -100,7 +148,6 @@ public class CabAssignmentService {
             return mapToResponse(assignment);
         }
 
-        // Validate one-directional lifecycle transition
         boolean valid = false;
         if (current == AssignmentStatus.PLANNED) {
             valid = (target == AssignmentStatus.IN_PROGRESS || target == AssignmentStatus.CANCELLED);
@@ -126,6 +173,11 @@ public class CabAssignmentService {
         log.info("Deleted cab assignment id={}", id);
     }
 
+    /**
+     * Builds / rebuilds the route for an assignment using NN + 2-opt.
+     * If the assignment already has passengers, re-optimizes those.
+     * If empty, fills from unassigned confirmed bookings (respecting capacity) then optimizes.
+     */
     @Transactional
     public CabAssignmentResponse buildRoute(Long id) {
         CabAssignment assignment = cabAssignmentRepository.findById(id)
@@ -134,203 +186,70 @@ public class CabAssignmentService {
         Shift shift = assignment.getShift();
         Office office = shift.getOffice();
         LocalDate date = assignment.getAssignmentDate();
+        int capacity = assignment.getCab().getCapacity();
 
-        List<Booking> confirmedBookings = bookingRepository.findByBookingDateAndShiftIdAndStatus(
-                date, shift.getId(), BookingStatus.CONFIRMED);
+        List<Booking> bookingsToRoute = assignment.getStops().stream()
+                .filter(s -> s.getBooking() != null)
+                .map(PickupStop::getBooking)
+                .toList();
 
-        // Clear existing stops
-        pickupStopRepository.deleteByCabAssignmentId(assignment.getId());
-        pickupStopRepository.flush();
-        assignment.getStops().clear();
+        if (bookingsToRoute.isEmpty()) {
+            Set<Long> alreadyAssigned = new HashSet<>();
+            for (CabAssignment other : cabAssignmentRepository.findByAssignmentDateAndShiftId(date, shift.getId())) {
+                if (other.getId().equals(assignment.getId())) {
+                    continue;
+                }
+                for (PickupStop s : other.getStops()) {
+                    if (s.getBooking() != null) {
+                        alreadyAssigned.add(s.getBooking().getId());
+                    }
+                }
+            }
 
-        if (confirmedBookings.isEmpty()) {
+            bookingsToRoute = bookingRepository
+                    .findByBookingDateAndShiftIdAndStatus(date, shift.getId(), BookingStatus.CONFIRMED)
+                    .stream()
+                    .filter(b -> !alreadyAssigned.contains(b.getId()))
+                    .limit(capacity)
+                    .toList();
+        }
+
+        if (bookingsToRoute.size() > capacity) {
+            throw new BusinessRuleException(String.format(
+                    "Seat capacity constraint violated: Cab %s holds %d, but %d passengers were requested",
+                    assignment.getCab().getLicensePlate(), capacity, bookingsToRoute.size()));
+        }
+
+        if (bookingsToRoute.isEmpty()) {
+            assignment.getStops().clear();
             assignment.setTotalDistanceKm(0.0);
             assignment.setTotalDurationMinutes(0);
             CabAssignment saved = cabAssignmentRepository.save(assignment);
             return mapToResponse(saved);
         }
 
-        // Limit bookings to cab capacity if needed
-        int capacity = assignment.getCab().getCapacity();
-        List<Booking> bookingsToRoute = confirmedBookings.size() > capacity
-                ? confirmedBookings.subList(0, capacity)
-                : new ArrayList<>(confirmedBookings);
+        OptimizedRouteResult routeResult = routeOptimizer.optimizeRoute(
+                office, bookingsToRoute, shift.getShiftType(), distanceProvider);
+        maxRideTimeValidator.validateRoute(routeResult, shift.getShiftType(),
+                routingProperties.getMaxRideMinutes());
 
-        List<RouteStopData> orderedStops = new ArrayList<>();
+        allocationService.applyStopsToAssignment(assignment, routeResult, shift, date);
+        assignment.setTotalDistanceKm(routeResult.getTotalDistanceKm());
+        assignment.setTotalDurationMinutes(routeResult.getTotalDurationMinutes());
+        assignment = cabAssignmentRepository.save(assignment);
 
-        if (shift.getShiftType() == ShiftType.INBOUND) {
-            // Nearest neighbour from office outward, then reverse so office is the final stop
-            List<Booking> unvisited = new ArrayList<>(bookingsToRoute);
-            List<Booking> orderedFromOffice = new ArrayList<>();
-            double currLat = office.getLatitude();
-            double currLon = office.getLongitude();
+        nightSafetyService.evaluateAndProtect(assignment);
+        assignment = cabAssignmentRepository.save(assignment);
+        maxRideTimeValidator.validateAssignment(assignment, routingProperties.getMaxRideMinutes());
 
-            while (!unvisited.isEmpty()) {
-                Booking closest = null;
-                double minDist = Double.MAX_VALUE;
-                for (Booking b : unvisited) {
-                    double dist = haversineKm(currLat, currLon, b.getPickupLatitude(), b.getPickupLongitude());
-                    if (dist < minDist) {
-                        minDist = dist;
-                        closest = b;
-                    }
-                }
-                orderedFromOffice.add(closest);
-                unvisited.remove(closest);
-                currLat = closest.getPickupLatitude();
-                currLon = closest.getPickupLongitude();
-            }
-
-            // Reverse so farthest employee is picked up first
-            Collections.reverse(orderedFromOffice);
-
-            for (Booking b : orderedFromOffice) {
-                orderedStops.add(new RouteStopData(
-                        StopType.PICKUP,
-                        b,
-                        b.getPickupAddress(),
-                        b.getPickupLatitude(),
-                        b.getPickupLongitude()
-                ));
-            }
-
-            // Office is the last stop
-            orderedStops.add(new RouteStopData(
-                    StopType.OFFICE,
-                    null,
-                    office.getAddress(),
-                    office.getLatitude(),
-                    office.getLongitude()
-            ));
-
-        } else {
-            // OUTBOUND: Office is first stop, then drop off in nearest neighbour order
-            orderedStops.add(new RouteStopData(
-                    StopType.OFFICE,
-                    null,
-                    office.getAddress(),
-                    office.getLatitude(),
-                    office.getLongitude()
-            ));
-
-            List<Booking> unvisited = new ArrayList<>(bookingsToRoute);
-            double currLat = office.getLatitude();
-            double currLon = office.getLongitude();
-
-            while (!unvisited.isEmpty()) {
-                Booking closest = null;
-                double minDist = Double.MAX_VALUE;
-                for (Booking b : unvisited) {
-                    double dist = haversineKm(currLat, currLon, b.getPickupLatitude(), b.getPickupLongitude());
-                    if (dist < minDist) {
-                        minDist = dist;
-                        closest = b;
-                    }
-                }
-                orderedStops.add(new RouteStopData(
-                        StopType.DROPOFF,
-                        closest,
-                        closest.getPickupAddress(),
-                        closest.getPickupLatitude(),
-                        closest.getPickupLongitude()
-                ));
-                unvisited.remove(closest);
-                currLat = closest.getPickupLatitude();
-                currLon = closest.getPickupLongitude();
-            }
-        }
-
-        // Calculate distance, duration, and planned times
-        double totalDistanceKm = 0.0;
-        int totalDurationMinutes = 0;
-        double[] legDistances = new double[orderedStops.size()];
-        int[] legDurations = new int[orderedStops.size()];
-
-        for (int i = 0; i < orderedStops.size(); i++) {
-            if (i == 0) {
-                legDistances[i] = 0.0;
-                legDurations[i] = 0;
-            } else {
-                RouteStopData prev = orderedStops.get(i - 1);
-                RouteStopData curr = orderedStops.get(i);
-                double d = haversineKm(prev.lat, prev.lon, curr.lat, curr.lon);
-                int dur = (int) Math.round((d / 30.0) * 60.0);
-                if (d > 0.05 && dur == 0) {
-                    dur = 1;
-                }
-                legDistances[i] = d;
-                legDurations[i] = dur;
-                totalDistanceKm += d;
-                totalDurationMinutes += dur;
-            }
-        }
-
-        // Calculate planned times
-        OffsetDateTime[] plannedTimes = new OffsetDateTime[orderedStops.size()];
-        OffsetDateTime now = OffsetDateTime.now();
-
-        if (shift.getShiftType() == ShiftType.INBOUND) {
-            // Arrival at office at shift.startTime
-            OffsetDateTime officeArrival = date.atTime(shift.getStartTime()).atOffset(now.getOffset());
-            OffsetDateTime routeStart = officeArrival.minusMinutes(totalDurationMinutes);
-            OffsetDateTime currentPlanned = routeStart;
-            for (int i = 0; i < orderedStops.size(); i++) {
-                if (i > 0) {
-                    currentPlanned = currentPlanned.plusMinutes(legDurations[i]);
-                }
-                plannedTimes[i] = currentPlanned;
-            }
-            plannedTimes[orderedStops.size() - 1] = officeArrival;
-        } else {
-            // Departure from office at shift.endTime
-            OffsetDateTime officeDeparture = date.atTime(shift.getEndTime()).atOffset(now.getOffset());
-            OffsetDateTime currentPlanned = officeDeparture;
-            for (int i = 0; i < orderedStops.size(); i++) {
-                if (i > 0) {
-                    currentPlanned = currentPlanned.plusMinutes(legDurations[i]);
-                }
-                plannedTimes[i] = currentPlanned;
-            }
-        }
-
-        // Persist PickupStop records
-        List<PickupStop> persistedStops = new ArrayList<>();
-        for (int i = 0; i < orderedStops.size(); i++) {
-            RouteStopData stopData = orderedStops.get(i);
-            PickupStop stop = PickupStop.builder()
-                    .cabAssignment(assignment)
-                    .booking(stopData.booking)
-                    .stopOrder(i + 1)
-                    .stopType(stopData.type)
-                    .latitude(stopData.lat)
-                    .longitude(stopData.lon)
-                    .address(stopData.address)
-                    .distanceFromPreviousKm(legDistances[i])
-                    .durationFromPreviousMinutes(legDurations[i])
-                    .plannedTime(plannedTimes[i])
-                    .build();
-            persistedStops.add(stop);
-        }
-
-        assignment.getStops().addAll(persistedStops);
-        assignment.setTotalDistanceKm(Math.round(totalDistanceKm * 100.0) / 100.0);
-        assignment.setTotalDurationMinutes(totalDurationMinutes);
-
-        CabAssignment saved = cabAssignmentRepository.save(assignment);
-        log.info("Built route for cab assignment id={} with {} stops, totalDistance={}km, totalDuration={}min",
-                saved.getId(), persistedStops.size(), saved.getTotalDistanceKm(), saved.getTotalDurationMinutes());
-        return mapToResponse(saved);
+        log.info("Built route for cab assignment id={} with {} stops", assignment.getId(), assignment.getStops().size());
+        return mapToResponse(assignment);
     }
 
-    private double haversineKm(double lat1, double lon1, double lat2, double lon2) {
-        final int R = 6371;
-        double dLat = Math.toRadians(lat2 - lat1);
-        double dLon = Math.toRadians(lon2 - lon1);
-        double a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
-                + Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2))
-                * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-        double c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-        return Math.round(R * c * 100.0) / 100.0;
+    private Employee getCaller() {
+        String email = SecurityContextHolder.getContext().getAuthentication().getName();
+        return employeeRepository.findByEmail(email)
+                .orElseThrow(() -> new ResourceNotFoundException("Authenticated employee not found"));
     }
 
     private CabAssignmentResponse mapToResponse(CabAssignment assignment) {
@@ -372,12 +291,4 @@ public class CabAssignmentService {
                         ? stop.getBooking().getEmployee().getName() : null)
                 .build();
     }
-
-    private record RouteStopData(
-            StopType type,
-            Booking booking,
-            String address,
-            double lat,
-            double lon
-    ) {}
 }

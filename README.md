@@ -5,7 +5,7 @@
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16%2F18-blue.svg)](https://www.postgresql.org/)
 [![React](https://img.shields.io/badge/React-19-cyan.svg)](https://react.dev/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.6-blue.svg)](https://www.typescriptlang.org/)
-[![Tests](https://img.shields.io/badge/Integration%20Tests-88%2F88%20Passing-success.svg)]()
+[![Tests](https://img.shields.io/badge/Integration%20Tests-93%2F93%20Passing-success.svg)]()
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)]()
 
 > **LPU Backend Case Studies 2026 — Official Reference Implementation**  
@@ -73,14 +73,15 @@ Corporate employee commute management faces a massive optimization challenge: pr
 - **Cluster by Location**: Groups employees based on their verified home geographic coordinates (latitude and longitude). Uses spatial proximity heuristics so that riders in the same cab reside within neighboring zones (e.g. Koramangala and HSR Layout are grouped together; distant areas like Whitefield and Electronic City are never mixed).
 - **Respect Seat Limit**: Cabs have fixed capacities ($K = 4$ or $K = 6$). A pool group strictly never exceeds the assigned vehicle's physical capacity.
 - **Keep Detours Small**: Enforces a maximum detour threshold; riders are only pooled together if the marginal travel distance added by an additional pickup falls within acceptable bounds.
-- **High-Volume Spatial Indexing**: Designed to avoid $O(N^2)$ exhaustive comparisons by utilizing grid/geohash spatial partitioning when clustering thousands of bookings.
+- **High-Volume Spatial Indexing**: Bookings are bucketed with **geohash** (precision 5 ≈ 4.9 km cells). Candidate riders are taken from the seed cell and its Moore neighbourhood, then filtered by `app.routing.max-cluster-radius-km` so far-apart areas are never mixed. Complexity ≈ $O(N \cdot C \cdot B)$ with $B \ll N$ (bucket size), not all-pairs $O(N^2)$.
+- **Distance Models**: Default path uses **Haversine** (great-circle) for fast local computation. Optional **OSRM** road distances (`app.routing.osrm.enabled`) fall back to Haversine on timeout/failure.
 
 ### II. Best Pickup Order (Routing Engine)
 - **Optimal Pickup Sequence**: Given $K$ employee pickup locations and 1 corporate office destination, determines the sequence minimizing total vehicle travel distance and drive time.
 - **2-Opt TSP Heuristic**: Treats pickup ordering as an open Traveling Salesperson Problem (TSP). Begins with a nearest-neighbor baseline tour and iteratively uncrosses sub-optimal intersecting paths using 2-Opt edge swaps until local optimality is reached.
 - **On-Time / Max-Ride Rule (Hard Unbreakable Rule)**: No employee may remain in the cab longer than the corporate maximum ride threshold (default: **90 minutes**). If any generated route ordering violates this threshold, the sequence is rejected by the validation pipeline and rejected from dispatch.
 - **Pickup ETAs**: Backward-schedules from shift start time at the office, computing precise pickup timestamps for each employee along the route using calibrated distance and travel speeds.
-- **Distance Models**: Incorporates a hybrid strategy: high-performance spherical **Haversine formula** calibrated with an urban tortuosity coefficient ($1.3\times$) for microsecond local calculation, backed by a pluggable road routing engine interface (**OSRM / OpenRouteService**).
+- **Distance Models**: Default **Haversine** great-circle distance (≈30 km/h average speed for ETA). Optional **OSRM** road routing (`app.routing.osrm.enabled`) with automatic Haversine fallback when OSRM is disabled or unreachable.
 
 ### III. Night Safety Rules
 - **No Woman Alone Rule**: In night shifts (between 20:00 and 06:00, or designated night outbound trips), a female employee must never be the first pickup (alone with the driver during pickup) or the last drop-off (alone with the driver at night).
@@ -103,9 +104,10 @@ Corporate employee commute management faces a massive optimization challenge: pr
 - **Salted BCrypt Password Hashing**: Passwords stored using Spring Security's `BCryptPasswordEncoder` (work factor 10), ensuring rainbow table resistance.
 - **Role-Based Access Control (RBAC)**:
   - `ROLE_ADMIN`: Authorized to trigger automated clustering, manual re-optimization, add fleet vehicles, view all cab assignments, and manage escort rosters.
-  - `ROLE_EMPLOYEE`: Restricted to self-service ride booking, personal trip itinerary inspection, and cancellation of their own active rides.
-- **Idempotency & Duplicate-Safety**: Composite database unique index `(employee_id, shift_id, booking_date)` prevents duplicate booking requests under concurrent network calls. Submitting the same booking twice safely results in a single seat reservation.
-- **Spring Security Filter Chain**: Custom `JwtAuthenticationFilter` intercepts requests, validates token signatures against the server secret, and establishes the `SecurityContextHolder`. Public paths (`/api/auth/**`, `/api/actuator/health`) bypass authentication, while business endpoints enforce authentication.
+  - `ROLE_EMPLOYEE`: Restricted to self-service ride booking, personal trip itinerary inspection (`/api/assignments/my`), and cancellation of their own active rides.
+- **Admin Self-Registration Blocked**: Public register cannot create `ROLE_ADMIN` unless `app.security.allow-admin-self-registration=true` (enabled only in tests). Production admins are seeded.
+- **Idempotency & Duplicate-Safety**: Only one `CONFIRMED` booking per `(employee_id, shift_id, booking_date)` (partial unique index). Cancel→rebook reactivates the same row instead of inserting a duplicate seat.
+- **Spring Security Filter Chain**: Custom `JwtAuthenticationFilter` validates JWTs. Public: `/api/auth/**`, `/actuator/health`, `/actuator/info`. Metrics require `ROLE_ADMIN`.
 
 ---
 
@@ -115,7 +117,7 @@ The Vehicle Routing Problem (VRP) is NP-hard. Rather than attempting factorial e
 
 | System Subsystem | Algorithm / Data Structure | Time Complexity (Best / Worst) | Space Complexity |
 | :--- | :--- | :--- | :--- |
-| **Spatial Clustering** | Greedy Seed-Selection with Spatial Bucketing | $O(N \log N)$ to $O(N \cdot K)$ | $O(N)$ reference list |
+| **Spatial Clustering** | Geohash buckets + greedy seed / nearest neighbour + max radius | $O(N \cdot C \cdot B)$ ($B$ = bucket size ≪ $N$) | $O(N)$ buckets + pool |
 | **Route Sequencing (TSP)** | Nearest-Neighbor + 2-Opt Edge Exchanges | $O(K^2)$ per cab ($K \le 6$) | $O(K)$ stop permutation array |
 | **Max-Ride Time Check** | Cumulative Travel Duration Scanner | $O(K)$ per candidate route | $O(1)$ auxiliary |
 | **Night Safety Audit** | Boundary Stop Gender Scanner | $O(K)$ | $O(1)$ |
@@ -126,20 +128,20 @@ The Vehicle Routing Problem (VRP) is NP-hard. Rather than attempting factorial e
 
 #### Algorithmic Complexity Breakdown:
 1. **Spatial Clustering ($N$ bookings, cab capacity $K \in \{4, 6\}$)**:
-   - Partitioning $N$ employees into $\lceil N/K \rceil$ cabs. For each seed employee, finding the $K-1$ nearest neighbors takes $O(N \log N)$ using sorted spatial distance or $O(N)$ with spatial grid buckets. Total clustering runtime: $O(N \cdot K)$.
+   - Encode each booking into a geohash cell; pick farthest-from-office seeds; fill each cab from the seed neighbourhood within `max-cluster-radius-km`. Never exceeds capacity. Leftover riders stay unassigned rather than overflowing a cab.
 2. **2-Opt Route Optimization ($K$ stops per vehicle)**:
-   - For corporate cabs where $K \le 6$, the number of candidate edge swap pairs is $\binom{K}{2} = \frac{K(K-1)}{2} \le 15$ operations per pass. The 2-Opt heuristic converges in $<0.5\text{ ms}$, delivering a near-optimal route ($<2\%$ optimality gap) without exponential explosion.
+   - For corporate cabs where $K \le 6$, NN + 2-Opt (≤50 iterations) is used instead of Held-Karp $O(2^K K^2)$. Max-ride (90 min) is validated after optimization, night reorder, late insert, and cancel replan.
 3. **Space Complexity ($O(N)$)**:
-   - The memory footprint scales linearly with active bookings $N$. Entities and intermediate permutation arrays are allocated on the JVM heap and reclaimed by garbage collection immediately after manifest generation.
+   - Clustering and routing allocations scale with active bookings; the distance LRU cache is bounded at 10,000 entries.
 
 ---
 
 ### 3. Fault Tolerance & System Failure Handling
-- **Routing API Circuit Breaker & Fallback**: If an external road routing engine (OSRM / ORS) experiences network downtime, rate-limiting, or timeouts (>1500ms), the system automatically degrades to high-precision spherical Haversine computation with an urban tortuosity coefficient ($1.3\times$), guaranteeing zero dispatch interruption.
-- **ACID Database Transactional Integrity**: All multi-step operations (clustering, cab assignment, stop persistence, dynamic insertion, cancellation) are annotated with `@Transactional(rollbackFor = Exception.class)`. Any unexpected runtime error triggers an immediate database rollback, preventing orphan records or partially assigned cabs.
-- **Database Backup & Recovery**: PostgreSQL Write-Ahead Logging (WAL) ensures point-in-time recovery. The relational schema is version-controlled via Flyway migration scripts (`V1__init_schema.sql`), allowing deterministic rebuilding of the database schema on any environment.
-- **Idempotent State Mutations**: Repetitive dispatch triggers or double-clicked booking submissions are guarded by database-level unique constraints, preventing duplicate seat allocations or race conditions.
-- **Graceful Client-Side Offline Degradation**: The frontend includes a resilient client layer that provides an interactive simulation fallback if the backend service is temporarily offline, synchronizing state once connectivity is restored.
+- **OSRM Fallback**: When `app.routing.osrm.enabled=true` and the HTTP call fails or times out, `OsrmDistanceProvider` degrades to Haversine so dispatch continues.
+- **ACID Transactions**: Clustering, assignment, insertion, and cancellation run inside Spring `@Transactional` boundaries so partial writes roll back on failure.
+- **Database Backup & Recovery**: PostgreSQL WAL + Flyway migrations (`V1` schema, `V2` seed, `V3` capacity/idempotency constraints).
+- **Idempotent Bookings**: Duplicate active bookings are rejected; cancel→rebook reactivates the same row. Partial unique index enforces one `CONFIRMED` booking per employee/shift/date.
+- **Live API only**: The React UI talks to Spring Boot (`/api`). Invalid JWTs are cleared; there is no mock-data fallback.
 
 ---
 
@@ -187,35 +189,28 @@ MoveInSync is developed using **Java 21**, applying modern OOP patterns for main
 | **Route Optimization** | 2-Opt Heuristic + Nearest Neighbor | Exact Held-Karp / Branch & Bound | Held-Karp $O(2^K K^2)$ has an exponential worst-case. For $K \le 6$, 2-Opt executes in $<0.5\text{ ms}$ with $<2\%$ optimality gap, ensuring fast response times under concurrent dispatch requests. |
 | **Distance Engine** | Haversine ($1.3\times$ factor) + OSRM Strategy | Google Maps Distance Matrix API | Commercial APIs introduce financial costs (\$5/1000 calls) and ~200ms network latency per pair. Haversine provides $O(1)$ sub-microsecond offline evaluation with zero external dependencies. |
 | **Spatial Indexing** | In-Memory Spatial Bucketing | PostGIS Extension | Utilizing relational PostgreSQL without requiring external native C-extensions keeps the architecture lightweight, cloud-portable, and simple to deploy in standard environments. |
-| **Caching Layer** | In-Memory `ConcurrentHashMap` with TTL | Distributed Redis Cluster | Single-node deployment achieves sub-microsecond latency without serialization overhead or network hop latency, sufficient for thousands of concurrent rides. |
+| **Caching Layer** | In-memory LRU distance cache (10k) | Distributed Redis | Sufficient for single-node dispatch; avoids Redis ops cost for a case-study footprint. |
 | **Constraint Enforcement** | Hard Unbreakable Rules | Soft Penalty Objectives | Seat capacity and the 90-minute max-ride limit are strictly rejected rather than penalized with weights, guaranteeing compliance with employee safety policies. |
 
 ---
 
 ### 6. System Monitoring, Telemetry & Real-Time Dashboards
 - **Spring Boot Actuator**:
-  - `/actuator/health`: Database connectivity status, disk capacity, and service health checks.
-  - `/actuator/metrics`: JVM heap memory usage, thread pool states, and garbage collection pauses.
-- **Custom Micrometer Metrics**:
-  - `cabpooling.clustering.duration`: Measures time spent grouping employees.
-  - `cabpooling.routing.optimization.duration`: Tracks 2-Opt algorithmic execution time.
-  - `cabpooling.night.safety.escorts.triggered`: Counts escort guards provisioned for female night safety.
-  - `cabpooling.cancellations.replanned`: Monitored count of live itinerary re-routes.
-- **Interactive Web UI Dispatcher Dashboard**: Real-time Leaflet map visualization displaying planned pickup itineraries, driver details, cab occupancy badges, night safety escort indicators, and live server connection telemetry.
-- **Structured SLF4J Logging**: Consistent log formatting capturing trace IDs, dispatch decisions, booking state changes, and constraint violation diagnostics.
+  - `/actuator/health` and `/actuator/info` are public.
+  - `/actuator/metrics` requires `ROLE_ADMIN`.
+- **Custom Micrometer Counters**:
+  - `cabpooling.allocations.auto_cluster`
+  - `cabpooling.allocations.bookings_assigned`
+- **Interactive Web UI**: Admin dispatcher map + employee pickup ETAs from `/api/assignments/my`.
+- **Structured SLF4J Logging**: Dispatch decisions, night-safety actions, and constraint violations.
 
 ---
 
 ### 7. Caching Strategy & Eviction Policies
 - **Distance Matrix Memoization (`DistanceCacheService`)**:
-  - Distance calculations between repeated coordinate pairs are cached in a thread-safe cache keyed by coordinate hashes: `hash(lat1, lon1, lat2, lon2)`.
-  - Avoids redundant trigonometric calls during multi-pass 2-Opt evaluations.
-- **Static Metadata Caching**:
-  - Corporate Office locations and Shift definitions are cached using Spring's `@Cacheable` abstraction.
-  - Cache invalidation is triggered using `@CacheEvict` whenever administrative modifications occur.
-- **Eviction Policies**:
-  - **Time-to-Live (TTL)**: Cached entries expire after 60 minutes.
-  - **LRU Size Bound**: Cache size is capped at 10,000 entries to prevent memory exhaustion on high-density fleets ($O(S^2)$ memory bound).
+  - Thread-safe **LRU** map keyed by directional coordinate pairs.
+  - Cap: **10,000** entries (eldest evicted) — used heavily during NN + 2-Opt.
+- **No Spring `@Cacheable` on offices/shifts** — those entities are cheap DB reads; distance caching is the hot path.
 
 ---
 
@@ -468,7 +463,7 @@ curl -X POST http://localhost:8080/api/allocations/insert-booking/5 \
 
 ### 8. Cancel Booking & Trigger Live Re-route
 ```bash
-curl -X POST http://localhost:8080/api/bookings/2/cancel \
+curl -X DELETE http://localhost:8080/api/bookings/2 \
   -H "Authorization: Bearer <EMPLOYEE_OR_ADMIN_TOKEN>"
 ```
 
@@ -529,10 +524,10 @@ Ensure PostgreSQL is active on port `5432` with database `employee_cab_pooling`.
 #### 2. Start Spring Boot Backend (Java 21)
 ```bash
 cd employee_cab_polling
-mvn clean spring-boot:run
+mvn spring-boot:run
 ```
 - REST API is available at: `http://127.0.0.1:8080/api`
-- Actuator Health check: `http://127.0.0.1:8080/api/actuator/health`
+- Actuator Health check: `http://127.0.0.1:8080/actuator/health`
 
 #### 3. Start React + TypeScript Frontend
 ```bash
@@ -553,15 +548,15 @@ cd employee_cab_polling
 mvn test
 ```
 
-### Integration Test Coverage Breakdown:
-- **`AllocationRouteOptimizationIntegrationTests`**: 15 tests (Spatial clustering, 2-Opt TSP optimization, distance reduction, capacity limits, max-ride threshold rejection).
-- **`EscortIntegrationTests`**: 11 tests (Night safety boundary hours, female rider protection, automated escort attachment).
-- **`LiveReplanningIntegrationTests`**: 3 tests (Marginal detour insertion, cancellation replanning without reshuffling untouched cabs).
-- **`AuthIntegrationTests`**: 9 tests (JWT issue/validation, BCrypt salted verification, RBAC endpoint guards).
-- **`ShiftBookingIntegrationTests`**: 18 tests (Idempotent duplicate booking protection, cutoff timers, booking lifecycle).
-- **`CabAssignmentIntegrationTests`**: 14 tests (Manifest generation, pickup stop sequencing, ETA computations).
-- **`OfficeEmployeeIntegrationTests`**: 10 tests (Corporate hub boundaries, employee address geocoding).
-- **`RepositoryIntegrationTests`**: 8 tests (Flyway migration verification, foreign key cascades, unique constraints).
+### Integration Test Coverage Breakdown (93 / 93 passing):
+- **`HardConstraintsUnitTest`**: Max-ride reject/accept, capacity 4|6 rule, geohash neighbourhood indexing.
+- **`AllocationRouteOptimizationIntegrationTests`**: Spatial clustering, 2-Opt TSP, night escort auto-attach, distance cache.
+- **`LiveReplanningIntegrationTests`**: Cancel local replan, late insert + detour, full-cab (capacity 4) rejection, cancel→rebook idempotency.
+- **`EscortIntegrationTests`**: Manual escort CRUD + RBAC.
+- **`AuthIntegrationTests`**: JWT issue/validation, BCrypt, RBAC endpoint guards.
+- **`CabAssignmentIntegrationTests`**: Manifest generation, NN+2-Opt build-route, ETA sequencing.
+- **`CabIntegrationTests`**: Fleet CRUD; capacity outside `{4,6}` rejected.
+- **`ShiftBookingIntegrationTests` / `OfficeEmployeeIntegrationTests` / `RepositoryIntegrationTests`**: Booking lifecycle, offices, Flyway constraints.
 
 ---
 *Developed for LPU Backend Case Studies 2026 — MoveInSync Smart Employee Cab Pooling Platform.*

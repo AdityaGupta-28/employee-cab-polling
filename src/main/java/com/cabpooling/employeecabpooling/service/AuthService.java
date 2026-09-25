@@ -7,6 +7,7 @@ import com.cabpooling.employeecabpooling.repository.EmployeeRepository;
 import com.cabpooling.employeecabpooling.security.CustomUserDetails;
 import com.cabpooling.employeecabpooling.security.JwtService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
@@ -25,12 +26,20 @@ public class AuthService {
     private final JwtService jwtService;
     private final AuthenticationManager authenticationManager;
 
+    @Value("${app.security.allow-admin-self-registration:false}")
+    private boolean allowAdminSelfRegistration;
+
     public AuthResponse register(RegisterRequest request) {
         if (employeeRepository.existsByEmail(request.getEmail())) {
             throw new IllegalArgumentException("Email already registered: " + request.getEmail());
         }
 
         Role role = (request.getRole() != null) ? request.getRole() : Role.ROLE_EMPLOYEE;
+        // Public registration must not escalate to admin unless explicitly enabled (tests only)
+        if (role == Role.ROLE_ADMIN && !allowAdminSelfRegistration) {
+            throw new IllegalArgumentException(
+                    "Admin accounts cannot be self-registered. Contact a system administrator.");
+        }
 
         Employee employee = Employee.builder()
                 .email(request.getEmail())

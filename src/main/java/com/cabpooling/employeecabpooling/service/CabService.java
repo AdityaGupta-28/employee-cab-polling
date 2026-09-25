@@ -3,6 +3,7 @@ package com.cabpooling.employeecabpooling.service;
 import com.cabpooling.employeecabpooling.dto.cab.CabRequest;
 import com.cabpooling.employeecabpooling.dto.cab.CabResponse;
 import com.cabpooling.employeecabpooling.dto.cab.CabStatusRequest;
+import com.cabpooling.employeecabpooling.exception.BusinessRuleException;
 import com.cabpooling.employeecabpooling.exception.DuplicateResourceException;
 import com.cabpooling.employeecabpooling.exception.ResourceNotFoundException;
 import com.cabpooling.employeecabpooling.model.entity.Cab;
@@ -12,15 +13,19 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
+import java.util.Set;
 
 @Service
 @RequiredArgsConstructor
 public class CabService {
 
+    private static final Set<Integer> ALLOWED_CAPACITIES = Set.of(4, 6);
+
     private final CabRepository cabRepository;
 
     @Transactional
     public CabResponse create(CabRequest request) {
+        validateCapacity(request.getCapacity());
         if (cabRepository.existsByLicensePlate(request.getLicensePlate())) {
             throw new DuplicateResourceException(
                     "Cab with license plate already exists: " + request.getLicensePlate());
@@ -52,6 +57,7 @@ public class CabService {
     @Transactional
     public CabResponse update(Long id, CabRequest request) {
         Cab cab = getOrThrow(id);
+        validateCapacity(request.getCapacity());
 
         // Allow updating licensePlate only if it hasn't changed or the new value is unique
         if (!cab.getLicensePlate().equalsIgnoreCase(request.getLicensePlate())
@@ -86,6 +92,12 @@ public class CabService {
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    private void validateCapacity(Integer capacity) {
+        if (capacity == null || !ALLOWED_CAPACITIES.contains(capacity)) {
+            throw new BusinessRuleException("Cab capacity must be 4 or 6 seats (case-study fleet rule)");
+        }
+    }
 
     private Cab getOrThrow(Long id) {
         return cabRepository.findById(id)

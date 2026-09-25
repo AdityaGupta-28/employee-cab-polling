@@ -1,8 +1,18 @@
 package com.cabpooling.employeecabpooling.config;
 
-import com.cabpooling.employeecabpooling.model.entity.*;
-import com.cabpooling.employeecabpooling.model.enums.*;
-import com.cabpooling.employeecabpooling.repository.*;
+import com.cabpooling.employeecabpooling.model.entity.Booking;
+import com.cabpooling.employeecabpooling.model.entity.Employee;
+import com.cabpooling.employeecabpooling.model.entity.Office;
+import com.cabpooling.employeecabpooling.model.entity.Shift;
+import com.cabpooling.employeecabpooling.model.enums.BookingStatus;
+import com.cabpooling.employeecabpooling.model.enums.Gender;
+import com.cabpooling.employeecabpooling.model.enums.Role;
+import com.cabpooling.employeecabpooling.model.enums.ShiftType;
+import com.cabpooling.employeecabpooling.repository.BookingRepository;
+import com.cabpooling.employeecabpooling.repository.CabRepository;
+import com.cabpooling.employeecabpooling.repository.EmployeeRepository;
+import com.cabpooling.employeecabpooling.repository.OfficeRepository;
+import com.cabpooling.employeecabpooling.repository.ShiftRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.CommandLineRunner;
@@ -13,12 +23,15 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDate;
 import java.time.LocalTime;
+import java.util.List;
 
 @Slf4j
 @Component
 @ConditionalOnProperty(name = "app.seed.enabled", havingValue = "true", matchIfMissing = true)
 @RequiredArgsConstructor
 public class DataInitializer implements CommandLineRunner {
+
+    private static final String SEED_PASSWORD = "password123";
 
     private final OfficeRepository officeRepository;
     private final EmployeeRepository employeeRepository;
@@ -31,13 +44,13 @@ public class DataInitializer implements CommandLineRunner {
     @Transactional
     public void run(String... args) {
         if (officeRepository.count() > 0) {
-            log.info("Demo data already present. Skipping DataInitializer.");
+            log.info("Seed data already present. Repairing credentials, phones, fleet capacity, and bookings.");
+            repairSeedAccounts();
             return;
         }
 
-        log.info("🌱 Seeding realistic MoveInSync Bangalore demo data...");
+        log.info("Seeding MoveInSync Bangalore offices, fleet, employees, and bookings...");
 
-        // 1. Corporate Office Hubs
         Office bellandurHq = officeRepository.save(Office.builder()
                 .name("MoveInSync Tech Park (Bellandur HQ)")
                 .address("Outer Ring Road, Bellandur, Bengaluru, Karnataka 560103")
@@ -59,7 +72,6 @@ public class DataInitializer implements CommandLineRunner {
                 .longitude(77.7381)
                 .build());
 
-        // 2. Shifts
         Shift morningInbound = shiftRepository.save(Shift.builder()
                 .office(bellandurHq)
                 .name("Morning Inbound (09:00 - 18:00)")
@@ -96,214 +108,160 @@ public class DataInitializer implements CommandLineRunner {
                 .cutoffMinutes(90)
                 .build());
 
-        // 3. Fleet Cabs
+        saveCab("KA-01-AB-1001", "Toyota Innova Crysta", 6, "Manjunath Gowda", "+919845011223");
+        saveCab("KA-03-CD-2002", "Maruti Suzuki Ertiga", 4, "Suresh Babu", "+919845033445");
+        saveCab("KA-05-EF-3003", "Mahindra Marazzo", 4, "Ganesh Hegde", "+919845055667");
+        saveCab("KA-01-GH-4004", "Toyota Rumion", 4, "Ravi Shankar", "+919845077889");
+        saveCab("KA-04-IJ-5005", "Honda Amaze", 4, "Vijay Bhaskar", "+919845099001");
+
+        String hash = passwordEncoder.encode(SEED_PASSWORD);
+
+        saveEmployee("Chief Dispatcher Rajesh", "admin@moveinsync.com", hash, Role.ROLE_ADMIN, Gender.MALE,
+                "+919900112233", "MG Road Corporate Center, Bengaluru", 12.9716, 77.5946);
+        Employee pooja = saveEmployee("Pooja Sharma", "pooja.sharma@moveinsync.com", hash, Role.ROLE_EMPLOYEE, Gender.FEMALE,
+                "+919876543201", "100ft Road, Indiranagar, Bengaluru", 12.9719, 77.6412);
+        Employee arun = saveEmployee("Arun Kumar", "arun.kumar@moveinsync.com", hash, Role.ROLE_EMPLOYEE, Gender.MALE,
+                "+919876543202", "HSR Layout Sector 1, Bengaluru", 12.9121, 77.6446);
+        Employee sneha = saveEmployee("Sneha Reddy", "sneha.reddy@moveinsync.com", hash, Role.ROLE_EMPLOYEE, Gender.FEMALE,
+                "+919876543203", "Koramangala 4th Block, Bengaluru", 12.9352, 77.6245);
+        Employee vikas = saveEmployee("Vikas Mehta", "vikas.mehta@moveinsync.com", hash, Role.ROLE_EMPLOYEE, Gender.MALE,
+                "+919876543204", "Sarjapur Main Road, Bengaluru", 12.9237, 77.6833);
+        Employee ananya = saveEmployee("Ananya Iyer", "ananya.iyer@moveinsync.com", hash, Role.ROLE_EMPLOYEE, Gender.FEMALE,
+                "+919876543205", "BTM Layout 2nd Stage, Bengaluru", 12.9166, 77.6101);
+        Employee rohit = saveEmployee("Rohit Verma", "rohit.verma@moveinsync.com", hash, Role.ROLE_EMPLOYEE, Gender.MALE,
+                "+919876543206", "Marathahalli Bridge, Bengaluru", 12.9569, 77.7011);
+
+        seedBookingsForDate(LocalDate.now(), morningInbound, nightOutbound, pooja, arun, sneha, vikas, ananya, rohit);
+        seedBookingsForDate(LocalDate.now().plusDays(1), morningInbound, nightOutbound, pooja, arun, sneha, vikas, ananya, rohit);
+
+        log.info("Seed complete: 3 offices, 4 shifts, 5 cabs (capacity 4 or 6), 7 users, bookings for today and tomorrow.");
+    }
+
+    private void repairSeedAccounts() {
+        String hash = passwordEncoder.encode(SEED_PASSWORD);
+
+        repairEmployee("admin@moveinsync.com", "Chief Dispatcher Rajesh", Role.ROLE_ADMIN, Gender.MALE,
+                "+919900112233", "MG Road Corporate Center, Bengaluru", 12.9716, 77.5946, hash);
+        Employee pooja = repairEmployee("pooja.sharma@moveinsync.com", "Pooja Sharma", Role.ROLE_EMPLOYEE, Gender.FEMALE,
+                "+919876543201", "100ft Road, Indiranagar, Bengaluru", 12.9719, 77.6412, hash);
+        Employee arun = repairEmployee("arun.kumar@moveinsync.com", "Arun Kumar", Role.ROLE_EMPLOYEE, Gender.MALE,
+                "+919876543202", "HSR Layout Sector 1, Bengaluru", 12.9121, 77.6446, hash);
+        Employee sneha = repairEmployee("sneha.reddy@moveinsync.com", "Sneha Reddy", Role.ROLE_EMPLOYEE, Gender.FEMALE,
+                "+919876543203", "Koramangala 4th Block, Bengaluru", 12.9352, 77.6245, hash);
+        Employee vikas = repairEmployee("vikas.mehta@moveinsync.com", "Vikas Mehta", Role.ROLE_EMPLOYEE, Gender.MALE,
+                "+919876543204", "Sarjapur Main Road, Bengaluru", 12.9237, 77.6833, hash);
+        Employee ananya = repairEmployee("ananya.iyer@moveinsync.com", "Ananya Iyer", Role.ROLE_EMPLOYEE, Gender.FEMALE,
+                "+919876543205", "BTM Layout 2nd Stage, Bengaluru", 12.9166, 77.6101, hash);
+        Employee rohit = repairEmployee("rohit.verma@moveinsync.com", "Rohit Verma", Role.ROLE_EMPLOYEE, Gender.MALE,
+                "+919876543206", "Marathahalli Bridge, Bengaluru", 12.9569, 77.7011, hash);
+
+        cabRepository.findAll().forEach(cab -> {
+            if (cab.getCapacity() != 4 && cab.getCapacity() != 6) {
+                cab.setCapacity(4);
+                cabRepository.save(cab);
+            }
+            cab.setDriverPhone(normalizePhone(cab.getDriverPhone(), cab.getDriverPhone()));
+            cabRepository.save(cab);
+        });
+
+        List<Shift> shifts = shiftRepository.findAll();
+        Shift morningInbound = shifts.stream()
+                .filter(s -> s.getShiftType() == ShiftType.INBOUND && s.getStartTime().equals(LocalTime.of(9, 0)))
+                .findFirst()
+                .orElse(shifts.stream().filter(s -> s.getShiftType() == ShiftType.INBOUND).findFirst().orElse(null));
+        Shift nightOutbound = shifts.stream()
+                .filter(s -> s.getShiftType() == ShiftType.OUTBOUND && s.getStartTime().equals(LocalTime.of(21, 30)))
+                .findFirst()
+                .orElse(shifts.stream().filter(s -> s.getShiftType() == ShiftType.OUTBOUND).findFirst().orElse(null));
+
+        if (morningInbound != null && nightOutbound != null
+                && pooja != null && arun != null && sneha != null && vikas != null && ananya != null && rohit != null) {
+            seedBookingsForDate(LocalDate.now(), morningInbound, nightOutbound, pooja, arun, sneha, vikas, ananya, rohit);
+            seedBookingsForDate(LocalDate.now().plusDays(1), morningInbound, nightOutbound, pooja, arun, sneha, vikas, ananya, rohit);
+        }
+    }
+
+    private void seedBookingsForDate(LocalDate date, Shift morningInbound, Shift nightOutbound,
+                                     Employee pooja, Employee arun, Employee sneha, Employee vikas,
+                                     Employee ananya, Employee rohit) {
+        ensureConfirmedBooking(pooja, morningInbound, date);
+        ensureConfirmedBooking(arun, morningInbound, date);
+        ensureConfirmedBooking(sneha, morningInbound, date);
+        ensureConfirmedBooking(vikas, morningInbound, date);
+        ensureConfirmedBooking(ananya, nightOutbound, date);
+        ensureConfirmedBooking(rohit, nightOutbound, date);
+        ensureConfirmedBooking(pooja, nightOutbound, date);
+    }
+
+    private void ensureConfirmedBooking(Employee employee, Shift shift, LocalDate date) {
+        if (bookingRepository.existsByEmployeeIdAndShiftIdAndBookingDateAndStatus(
+                employee.getId(), shift.getId(), date, BookingStatus.CONFIRMED)) {
+            return;
+        }
+        bookingRepository.findByEmployeeIdAndShiftIdAndBookingDate(employee.getId(), shift.getId(), date)
+                .ifPresentOrElse(existing -> {
+                    existing.setStatus(BookingStatus.CONFIRMED);
+                    existing.setPickupLatitude(employee.getHomeLatitude());
+                    existing.setPickupLongitude(employee.getHomeLongitude());
+                    existing.setPickupAddress(employee.getHomeAddress());
+                    bookingRepository.save(existing);
+                }, () -> bookingRepository.save(Booking.builder()
+                        .employee(employee)
+                        .shift(shift)
+                        .bookingDate(date)
+                        .pickupLatitude(employee.getHomeLatitude())
+                        .pickupLongitude(employee.getHomeLongitude())
+                        .pickupAddress(employee.getHomeAddress())
+                        .status(BookingStatus.CONFIRMED)
+                        .build()));
+    }
+
+    private Employee repairEmployee(String email, String name, Role role, Gender gender, String phone,
+                                    String address, double lat, double lon, String passwordHash) {
+        return employeeRepository.findByEmail(email).map(existing -> {
+            existing.setName(name);
+            existing.setRole(role);
+            existing.setGender(gender);
+            existing.setPhoneNumber(phone);
+            existing.setHomeAddress(address);
+            existing.setHomeLatitude(lat);
+            existing.setHomeLongitude(lon);
+            existing.setPasswordHash(passwordHash);
+            return employeeRepository.save(existing);
+        }).orElseGet(() -> saveEmployee(name, email, passwordHash, role, gender, phone, address, lat, lon));
+    }
+
+    private Employee saveEmployee(String name, String email, String hash, Role role, Gender gender,
+                                  String phone, String address, double lat, double lon) {
+        return employeeRepository.save(Employee.builder()
+                .name(name)
+                .email(email)
+                .passwordHash(hash)
+                .role(role)
+                .gender(gender)
+                .phoneNumber(phone)
+                .homeAddress(address)
+                .homeLatitude(lat)
+                .homeLongitude(lon)
+                .build());
+    }
+
+    private void saveCab(String plate, String model, int capacity, String driver, String phone) {
         cabRepository.save(Cab.builder()
-                .licensePlate("KA-01-AB-1001")
-                .model("Toyota Innova Crysta")
-                .capacity(6)
-                .driverName("Manjunath Gowda")
-                .driverPhone("+91 98450 11223")
+                .licensePlate(plate)
+                .model(model)
+                .capacity(capacity)
+                .driverName(driver)
+                .driverPhone(phone)
                 .isActive(true)
                 .build());
+    }
 
-        cabRepository.save(Cab.builder()
-                .licensePlate("KA-03-CD-2002")
-                .model("Maruti Suzuki Ertiga")
-                .capacity(4)
-                .driverName("Suresh Babu")
-                .driverPhone("+91 98450 33445")
-                .isActive(true)
-                .build());
-
-        cabRepository.save(Cab.builder()
-                .licensePlate("KA-05-EF-3003")
-                .model("Mahindra Marazzo")
-                .capacity(4)
-                .driverName("Ganesh Hegde")
-                .driverPhone("+91 98450 55667")
-                .isActive(true)
-                .build());
-
-        cabRepository.save(Cab.builder()
-                .licensePlate("KA-01-GH-4004")
-                .model("Toyota Rumion")
-                .capacity(4)
-                .driverName("Ravi Shankar")
-                .driverPhone("+91 98450 77889")
-                .isActive(true)
-                .build());
-
-        cabRepository.save(Cab.builder()
-                .licensePlate("KA-04-IJ-5005")
-                .model("Honda City")
-                .capacity(3)
-                .driverName("Vijay Bhaskar")
-                .driverPhone("+91 98450 99001")
-                .isActive(true)
-                .build());
-
-        // 4. Employees & Admin Dispatcher
-        String defaultPasswordHash = passwordEncoder.encode("password123");
-
-        employeeRepository.save(Employee.builder()
-                .name("Chief Dispatcher Rajesh")
-                .email("admin@moveinsync.com")
-                .passwordHash(defaultPasswordHash)
-                .role(Role.ROLE_ADMIN)
-                .gender(Gender.MALE)
-                .phoneNumber("+91 99001 12233")
-                .homeAddress("MG Road Corporate Center, Bengaluru")
-                .homeLatitude(12.9716)
-                .homeLongitude(77.5946)
-                .build());
-
-        Employee pooja = employeeRepository.save(Employee.builder()
-                .name("Pooja Sharma")
-                .email("pooja.sharma@moveinsync.com")
-                .passwordHash(defaultPasswordHash)
-                .role(Role.ROLE_EMPLOYEE)
-                .gender(Gender.FEMALE)
-                .phoneNumber("+91 98765 43201")
-                .homeAddress("100ft Road, Indiranagar, Bengaluru")
-                .homeLatitude(12.9719)
-                .homeLongitude(77.6412)
-                .build());
-
-        Employee arun = employeeRepository.save(Employee.builder()
-                .name("Arun Kumar")
-                .email("arun.kumar@moveinsync.com")
-                .passwordHash(defaultPasswordHash)
-                .role(Role.ROLE_EMPLOYEE)
-                .gender(Gender.MALE)
-                .phoneNumber("+91 98765 43202")
-                .homeAddress("HSR Layout Sector 1, Bengaluru")
-                .homeLatitude(12.9121)
-                .homeLongitude(77.6446)
-                .build());
-
-        Employee sneha = employeeRepository.save(Employee.builder()
-                .name("Sneha Reddy")
-                .email("sneha.reddy@moveinsync.com")
-                .passwordHash(defaultPasswordHash)
-                .role(Role.ROLE_EMPLOYEE)
-                .gender(Gender.FEMALE)
-                .phoneNumber("+91 98765 43203")
-                .homeAddress("Koramangala 4th Block, Bengaluru")
-                .homeLatitude(12.9352)
-                .homeLongitude(77.6245)
-                .build());
-
-        Employee vikas = employeeRepository.save(Employee.builder()
-                .name("Vikas Mehta")
-                .email("vikas.mehta@moveinsync.com")
-                .passwordHash(defaultPasswordHash)
-                .role(Role.ROLE_EMPLOYEE)
-                .gender(Gender.MALE)
-                .phoneNumber("+91 98765 43204")
-                .homeAddress("Sarjapur Main Road, Bengaluru")
-                .homeLatitude(12.9237)
-                .homeLongitude(77.6833)
-                .build());
-
-        Employee ananya = employeeRepository.save(Employee.builder()
-                .name("Ananya Iyer")
-                .email("ananya.iyer@moveinsync.com")
-                .passwordHash(defaultPasswordHash)
-                .role(Role.ROLE_EMPLOYEE)
-                .gender(Gender.FEMALE)
-                .phoneNumber("+91 98765 43205")
-                .homeAddress("BTM Layout 2nd Stage, Bengaluru")
-                .homeLatitude(12.9166)
-                .homeLongitude(77.6101)
-                .build());
-
-        Employee rohit = employeeRepository.save(Employee.builder()
-                .name("Rohit Verma")
-                .email("rohit.verma@moveinsync.com")
-                .passwordHash(defaultPasswordHash)
-                .role(Role.ROLE_EMPLOYEE)
-                .gender(Gender.MALE)
-                .phoneNumber("+91 98765 43206")
-                .homeAddress("Marathahalli Bridge, Bengaluru")
-                .homeLatitude(12.9569)
-                .homeLongitude(77.7011)
-                .build());
-
-        // 5. Pre-Seeded Bookings for Tomorrow
-        LocalDate targetDate = LocalDate.now().plusDays(1);
-
-        // Morning Shift Bookings (Inbound)
-        bookingRepository.save(Booking.builder()
-                .employee(pooja)
-                .shift(morningInbound)
-                .bookingDate(targetDate)
-                .pickupLatitude(pooja.getHomeLatitude())
-                .pickupLongitude(pooja.getHomeLongitude())
-                .pickupAddress(pooja.getHomeAddress())
-                .status(BookingStatus.CONFIRMED)
-                .build());
-
-        bookingRepository.save(Booking.builder()
-                .employee(arun)
-                .shift(morningInbound)
-                .bookingDate(targetDate)
-                .pickupLatitude(arun.getHomeLatitude())
-                .pickupLongitude(arun.getHomeLongitude())
-                .pickupAddress(arun.getHomeAddress())
-                .status(BookingStatus.CONFIRMED)
-                .build());
-
-        bookingRepository.save(Booking.builder()
-                .employee(sneha)
-                .shift(morningInbound)
-                .bookingDate(targetDate)
-                .pickupLatitude(sneha.getHomeLatitude())
-                .pickupLongitude(sneha.getHomeLongitude())
-                .pickupAddress(sneha.getHomeAddress())
-                .status(BookingStatus.CONFIRMED)
-                .build());
-
-        bookingRepository.save(Booking.builder()
-                .employee(vikas)
-                .shift(morningInbound)
-                .bookingDate(targetDate)
-                .pickupLatitude(vikas.getHomeLatitude())
-                .pickupLongitude(vikas.getHomeLongitude())
-                .pickupAddress(vikas.getHomeAddress())
-                .status(BookingStatus.CONFIRMED)
-                .build());
-
-        // Night Outbound Shift Bookings (Outbound with female employees to trigger night safety escort!)
-        bookingRepository.save(Booking.builder()
-                .employee(ananya)
-                .shift(nightOutbound)
-                .bookingDate(targetDate)
-                .pickupLatitude(ananya.getHomeLatitude())
-                .pickupLongitude(ananya.getHomeLongitude())
-                .pickupAddress(ananya.getHomeAddress())
-                .status(BookingStatus.CONFIRMED)
-                .build());
-
-        bookingRepository.save(Booking.builder()
-                .employee(rohit)
-                .shift(nightOutbound)
-                .bookingDate(targetDate)
-                .pickupLatitude(rohit.getHomeLatitude())
-                .pickupLongitude(rohit.getHomeLongitude())
-                .pickupAddress(rohit.getHomeAddress())
-                .status(BookingStatus.CONFIRMED)
-                .build());
-
-        bookingRepository.save(Booking.builder()
-                .employee(pooja)
-                .shift(nightOutbound)
-                .bookingDate(targetDate)
-                .pickupLatitude(pooja.getHomeLatitude())
-                .pickupLongitude(pooja.getHomeLongitude())
-                .pickupAddress(pooja.getHomeAddress())
-                .status(BookingStatus.CONFIRMED)
-                .build());
-
-        log.info("✅ MoveInSync demo data seeded successfully: 3 Offices, 4 Shifts, 5 Cabs, 7 Users, 7 Bookings for date {}.", targetDate);
+    private static String normalizePhone(String raw, String fallback) {
+        if (raw == null) {
+            return fallback;
+        }
+        String digits = raw.replaceAll("[^0-9+]", "");
+        return digits.isBlank() ? fallback : digits;
     }
 }

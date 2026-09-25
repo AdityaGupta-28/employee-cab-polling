@@ -58,6 +58,8 @@ class LiveReplanningIntegrationTests {
     private String employee1Token;
     private String employee2Token;
     private String employee3Token;
+    private String employee4Token;
+    private String employee5Token;
 
     private Long officeId;
     private Long shiftId;
@@ -89,6 +91,18 @@ class LiveReplanningIntegrationTests {
                 .homeAddress("Bellandur, Bangalore").homeLatitude(12.9260).homeLongitude(77.6762).build());
         employee3Token = "Bearer " + emp3.getToken();
 
+        AuthResponse emp4 = authService.register(RegisterRequest.builder()
+                .email("emp10d@test.com").password("password123").name("Neha")
+                .gender(Gender.FEMALE).role(Role.ROLE_EMPLOYEE).phoneNumber("+919600000005")
+                .homeAddress("BTM Layout, Bangalore").homeLatitude(12.9166).homeLongitude(77.6101).build());
+        employee4Token = "Bearer " + emp4.getToken();
+
+        AuthResponse emp5 = authService.register(RegisterRequest.builder()
+                .email("emp10e@test.com").password("password123").name("Vikram")
+                .gender(Gender.MALE).role(Role.ROLE_EMPLOYEE).phoneNumber("+919600000006")
+                .homeAddress("Jayanagar, Bangalore").homeLatitude(12.9308).homeLongitude(77.5838).build());
+        employee5Token = "Bearer " + emp5.getToken();
+
         OfficeResponse office = officeService.create(OfficeRequest.builder()
                 .name("Tech Park Main Hub").address("Whitefield, Bangalore")
                 .latitude(12.9850).longitude(77.7300).build());
@@ -100,15 +114,14 @@ class LiveReplanningIntegrationTests {
                 .shiftType(ShiftType.INBOUND).cutoffMinutes(0).build());
         shiftId = shift.getId();
 
-        // Deactivate pre-existing cabs to guarantee test isolation
         cabRepository.findAll().forEach(c -> {
             c.setIsActive(false);
             cabRepository.save(c);
         });
 
-        // Cab with capacity 2
+        // Case-study capacity: 4 seats
         cabService.create(CabRequest.builder()
-                .licensePlate("KA05RP1001").model("Maruti Dzire").capacity(2)
+                .licensePlate("KA05RP1001").model("Maruti Ertiga").capacity(4)
                 .driverName("Ganesh").driverPhone("+919876543301").build());
 
         targetDate = LocalDate.now().plusDays(2);
@@ -117,7 +130,6 @@ class LiveReplanningIntegrationTests {
     @Test
     @DisplayName("Cancelling an assigned booking automatically removes stop and recalculates route")
     void cancelBooking_assignedToCab_shouldRerouteCab() throws Exception {
-        // Create 2 bookings
         String b1Res = mockMvc.perform(post("/api/bookings")
                         .header("Authorization", employee1Token)
                         .contentType(MediaType.APPLICATION_JSON)
@@ -138,22 +150,18 @@ class LiveReplanningIntegrationTests {
                                 .pickupAddress("HSR Layout").build())))
                 .andExpect(status().isOk());
 
-        // Auto-cluster
         AutoClusterResponse clusterRes = allocationService.autoCluster(AutoClusterRequest.builder()
                 .shiftId(shiftId).assignmentDate(targetDate).build());
         Long assignmentId = clusterRes.getAssignments().get(0).getId();
 
-        // Check 3 stops (2 pickups + 1 office)
         CabAssignmentResponse beforeCancel = cabAssignmentService.findById(assignmentId);
         assertEquals(3, beforeCancel.getStops().size());
 
-        // Employee 1 cancels their booking
         mockMvc.perform(delete("/api/bookings/" + bookingId1)
                         .header("Authorization", employee1Token))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("CANCELLED"));
 
-        // Verify cab now only has 2 stops (1 pickup + 1 office)
         CabAssignmentResponse afterCancel = cabAssignmentService.findById(assignmentId);
         assertEquals(2, afterCancel.getStops().size());
         assertEquals("HSR Layout", afterCancel.getStops().get(0).getAddress());
@@ -163,7 +171,6 @@ class LiveReplanningIntegrationTests {
     @Test
     @DisplayName("Admin can dynamically slot a late booking into an available cab with detour calculation")
     void insertLateBooking_admin_shouldSlotIntoBestCab() throws Exception {
-        // Employee 1 books
         mockMvc.perform(post("/api/bookings")
                         .header("Authorization", employee1Token)
                         .contentType(MediaType.APPLICATION_JSON)
@@ -173,12 +180,10 @@ class LiveReplanningIntegrationTests {
                                 .pickupAddress("Koramangala").build())))
                 .andExpect(status().isOk());
 
-        // Auto-cluster with 1 booking in a capacity 2 cab
         AutoClusterResponse clusterRes = allocationService.autoCluster(AutoClusterRequest.builder()
                 .shiftId(shiftId).assignmentDate(targetDate).build());
         Long assignmentId = clusterRes.getAssignments().get(0).getId();
 
-        // Late booking by Employee 3
         String lateBookingRes = mockMvc.perform(post("/api/bookings")
                         .header("Authorization", employee3Token)
                         .contentType(MediaType.APPLICATION_JSON)
@@ -190,57 +195,84 @@ class LiveReplanningIntegrationTests {
                 .andReturn().getResponse().getContentAsString();
         Long lateBookingId = objectMapper.readTree(lateBookingRes).path("id").asLong();
 
-        // Insert late booking
         mockMvc.perform(post("/api/allocations/insert-booking/" + lateBookingId)
                         .header("Authorization", adminToken))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.bookingId").value(lateBookingId))
                 .andExpect(jsonPath("$.cabAssignmentId").value(assignmentId))
-                .andExpect(jsonPath("$.assignment.stops", hasSize(3))) // 2 pickups + 1 office
+                .andExpect(jsonPath("$.assignment.stops", hasSize(3)))
                 .andExpect(jsonPath("$.detourKm", greaterThanOrEqualTo(0.0)));
     }
 
     @Test
     @DisplayName("Inserting late booking fails with 400 when all candidate cabs are full")
     void insertLateBooking_fullCapacity_shouldReturn400() throws Exception {
-        // Fill the capacity 2 cab with 2 bookings
-        mockMvc.perform(post("/api/bookings")
+        String[] tokens = {employee1Token, employee2Token, employee3Token, employee4Token};
+        double[][] coords = {
+                {12.9352, 77.6245}, {12.9121, 77.6446}, {12.9260, 77.6762}, {12.9166, 77.6101}
+        };
+        String[] addresses = {"Koramangala", "HSR Layout", "Bellandur", "BTM Layout"};
+
+        for (int i = 0; i < 4; i++) {
+            mockMvc.perform(post("/api/bookings")
+                            .header("Authorization", tokens[i])
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(objectMapper.writeValueAsString(BookingRequest.builder()
+                                    .shiftId(shiftId).bookingDate(targetDate)
+                                    .pickupLatitude(coords[i][0]).pickupLongitude(coords[i][1])
+                                    .pickupAddress(addresses[i]).build())))
+                    .andExpect(status().isOk());
+        }
+
+        allocationService.autoCluster(AutoClusterRequest.builder()
+                .shiftId(shiftId).assignmentDate(targetDate).build());
+
+        String lateBookingRes = mockMvc.perform(post("/api/bookings")
+                        .header("Authorization", employee5Token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(BookingRequest.builder()
+                                .shiftId(shiftId).bookingDate(targetDate)
+                                .pickupLatitude(12.9308).pickupLongitude(77.5838)
+                                .pickupAddress("Jayanagar").build())))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        Long lateBookingId = objectMapper.readTree(lateBookingRes).path("id").asLong();
+
+        mockMvc.perform(post("/api/allocations/insert-booking/" + lateBookingId)
+                        .header("Authorization", adminToken))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("Business Rule Violation"));
+    }
+
+    @Test
+    @DisplayName("Cancel then rebook same shift/date reactivates one seat (idempotent)")
+    void cancelThenRebook_shouldReactivateSameSeat() throws Exception {
+        String createRes = mockMvc.perform(post("/api/bookings")
                         .header("Authorization", employee1Token)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(BookingRequest.builder()
                                 .shiftId(shiftId).bookingDate(targetDate)
                                 .pickupLatitude(12.9352).pickupLongitude(77.6245)
                                 .pickupAddress("Koramangala").build())))
-                .andExpect(status().isOk());
-
-        mockMvc.perform(post("/api/bookings")
-                        .header("Authorization", employee2Token)
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(objectMapper.writeValueAsString(BookingRequest.builder()
-                                .shiftId(shiftId).bookingDate(targetDate)
-                                .pickupLatitude(12.9121).pickupLongitude(77.6446)
-                                .pickupAddress("HSR Layout").build())))
-                .andExpect(status().isOk());
-
-        allocationService.autoCluster(AutoClusterRequest.builder()
-                .shiftId(shiftId).assignmentDate(targetDate).build());
-
-        // Late booking by Employee 3
-        String lateBookingRes = mockMvc.perform(post("/api/bookings")
-                        .header("Authorization", employee3Token)
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(objectMapper.writeValueAsString(BookingRequest.builder()
-                                .shiftId(shiftId).bookingDate(targetDate)
-                                .pickupLatitude(12.9260).pickupLongitude(77.6762)
-                                .pickupAddress("Bellandur").build())))
                 .andExpect(status().isOk())
                 .andReturn().getResponse().getContentAsString();
-        Long lateBookingId = objectMapper.readTree(lateBookingRes).path("id").asLong();
+        Long bookingId = objectMapper.readTree(createRes).path("id").asLong();
 
-        // Attempting insertion into full cab should fail
-        mockMvc.perform(post("/api/allocations/insert-booking/" + lateBookingId)
-                        .header("Authorization", adminToken))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.error").value("Business Rule Violation"));
+        mockMvc.perform(delete("/api/bookings/" + bookingId)
+                        .header("Authorization", employee1Token))
+                .andExpect(status().isOk());
+
+        String rebookRes = mockMvc.perform(post("/api/bookings")
+                        .header("Authorization", employee1Token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(BookingRequest.builder()
+                                .shiftId(shiftId).bookingDate(targetDate)
+                                .pickupLatitude(12.9352).pickupLongitude(77.6245)
+                                .pickupAddress("Koramangala Updated").build())))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("CONFIRMED"))
+                .andReturn().getResponse().getContentAsString();
+
+        assertEquals(bookingId, objectMapper.readTree(rebookRes).path("id").asLong());
     }
 }

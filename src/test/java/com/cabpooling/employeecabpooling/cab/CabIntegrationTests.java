@@ -57,7 +57,7 @@ class CabIntegrationTests {
         return CabRequest.builder()
                 .licensePlate(plate)
                 .model("Toyota Innova")
-                .capacity(7)
+                .capacity(6)
                 .driverName("Raju Kumar")
                 .driverPhone("+919876543210")
                 .build();
@@ -104,7 +104,7 @@ class CabIntegrationTests {
     }
 
     @Test
-    @DisplayName("Invalid capacity returns 400 validation error")
+    @DisplayName("Capacity outside {4,6} returns 400")
     void createCab_invalidCapacity_shouldReturn400() throws Exception {
         CabRequest bad = CabRequest.builder()
                 .licensePlate("KA01BAD001").model("Test").capacity(0)
@@ -116,6 +116,16 @@ class CabIntegrationTests {
                         .content(objectMapper.writeValueAsString(bad)))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.fields.capacity").exists());
+
+        CabRequest fiveSeats = CabRequest.builder()
+                .licensePlate("KA01BAD005").model("Test").capacity(5)
+                .driverName("Driver").driverPhone("+919876543210").build();
+
+        mockMvc.perform(post("/api/cabs")
+                        .header("Authorization", adminToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(fiveSeats)))
+                .andExpect(status().isBadRequest());
     }
 
     // =========================================================================

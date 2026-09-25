@@ -38,8 +38,15 @@ public class CabAssignmentController {
         return ResponseEntity.ok(responses);
     }
 
+    @GetMapping("/my")
+    @PreAuthorize("isAuthenticated()")
+    public ResponseEntity<List<CabAssignmentResponse>> myAssignments(
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+        return ResponseEntity.ok(cabAssignmentService.findMyAssignments(date));
+    }
+
     @GetMapping("/{id}")
-    @PreAuthorize("hasAuthority('ROLE_ADMIN')")
+    @PreAuthorize("isAuthenticated()")
     public ResponseEntity<CabAssignmentResponse> getAssignmentById(@PathVariable Long id) {
         CabAssignmentResponse response = cabAssignmentService.findById(id);
         return ResponseEntity.ok(response);

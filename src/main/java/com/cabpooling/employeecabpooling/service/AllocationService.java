@@ -1,5 +1,6 @@
 package com.cabpooling.employeecabpooling.service;
 
+import com.cabpooling.employeecabpooling.config.RoutingProperties;
 import com.cabpooling.employeecabpooling.dto.allocation.AutoClusterRequest;
 import com.cabpooling.employeecabpooling.dto.allocation.AutoClusterResponse;
 import com.cabpooling.employeecabpooling.dto.assignment.CabAssignmentResponse;
@@ -10,16 +11,17 @@ import com.cabpooling.employeecabpooling.model.entity.*;
 import com.cabpooling.employeecabpooling.model.enums.AssignmentStatus;
 import com.cabpooling.employeecabpooling.model.enums.BookingStatus;
 import com.cabpooling.employeecabpooling.model.enums.ShiftType;
-import com.cabpooling.employeecabpooling.model.enums.StopType;
 import com.cabpooling.employeecabpooling.repository.BookingRepository;
 import com.cabpooling.employeecabpooling.repository.CabAssignmentRepository;
 import com.cabpooling.employeecabpooling.repository.CabRepository;
-import com.cabpooling.employeecabpooling.repository.PickupStopRepository;
 import com.cabpooling.employeecabpooling.repository.ShiftRepository;
 import com.cabpooling.employeecabpooling.routing.DistanceProvider;
+import com.cabpooling.employeecabpooling.routing.GeohashUtil;
 import com.cabpooling.employeecabpooling.routing.optimizer.TwoOptRouteOptimizer;
 import com.cabpooling.employeecabpooling.routing.optimizer.TwoOptRouteOptimizer.OptimizedRouteResult;
 import com.cabpooling.employeecabpooling.routing.optimizer.TwoOptRouteOptimizer.OptimizedStop;
+import com.cabpooling.employeecabpooling.routing.validator.MaxRideTimeValidator;
+import io.micrometer.core.instrument.MeterRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -28,7 +30,11 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 @Slf4j
 @Service
@@ -39,11 +45,12 @@ public class AllocationService {
     private final CabRepository cabRepository;
     private final BookingRepository bookingRepository;
     private final CabAssignmentRepository cabAssignmentRepository;
-    private final PickupStopRepository pickupStopRepository;
     private final DistanceProvider distanceProvider;
     private final TwoOptRouteOptimizer routeOptimizer;
     private final NightSafetyService nightSafetyService;
-    private final com.cabpooling.employeecabpooling.routing.validator.MaxRideTimeValidator maxRideTimeValidator;
+    private final MaxRideTimeValidator maxRideTimeValidator;
+    private final RoutingProperties routingProperties;
+    private final MeterRegistry meterRegistry;
 
     @Transactional
     public AutoClusterResponse autoCluster(AutoClusterRequest request) {
@@ -67,7 +74,6 @@ public class AllocationService {
                     .build();
         }
 
-        // Delete any existing PLANNED assignments for this shift & date to re-cluster with new bookings
         List<CabAssignment> existingPlanned = cabAssignmentRepository.findByAssignmentDateAndShiftId(date, shift.getId())
                 .stream().filter(a -> a.getStatus() == AssignmentStatus.PLANNED).toList();
         if (!existingPlanned.isEmpty()) {
@@ -75,18 +81,16 @@ public class AllocationService {
             cabAssignmentRepository.flush();
         }
 
-        // Available active cabs
         List<Cab> availableCabs = cabRepository.findByIsActive(true);
-
         if (availableCabs.isEmpty()) {
             throw new BusinessRuleException("No active cabs found in fleet. Please activate cabs in Fleet management.");
         }
 
-        // Spatial Greedy Clustering: Group bookings by proximity respecting cab capacity
         List<List<Booking>> clusters = clusterBookingsByProximity(confirmedBookings, availableCabs, office);
 
         List<CabAssignmentResponse> createdAssignmentResponses = new ArrayList<>();
         int cabIdx = 0;
+        int assignedCount = 0;
 
         for (List<Booking> clusterBookings : clusters) {
             if (clusterBookings.isEmpty() || cabIdx >= availableCabs.size()) {
@@ -95,7 +99,6 @@ public class AllocationService {
 
             Cab cab = availableCabs.get(cabIdx++);
 
-            // Hard Rule 1: Seat Capacity Constraint Check
             if (clusterBookings.size() > cab.getCapacity()) {
                 throw new BusinessRuleException(String.format(
                         "Seat capacity constraint violated: Cab %s capacity is %d, but %d passengers were assigned",
@@ -113,33 +116,38 @@ public class AllocationService {
 
             assignment = cabAssignmentRepository.save(assignment);
 
-            // Optimize route using 2-Opt and distance provider
             OptimizedRouteResult routeResult = routeOptimizer.optimizeRoute(
                     office, clusterBookings, shift.getShiftType(), distanceProvider);
 
-            // Hard Rule 2: Max-Ride-Time Validation (90 minutes limit)
-            maxRideTimeValidator.validateRoute(routeResult, shift.getShiftType());
+            maxRideTimeValidator.validateRoute(routeResult, shift.getShiftType(),
+                    routingProperties.getMaxRideMinutes());
 
             applyStopsToAssignment(assignment, routeResult, shift, date);
             assignment.setTotalDistanceKm(routeResult.getTotalDistanceKm());
             assignment.setTotalDurationMinutes(routeResult.getTotalDurationMinutes());
-
             assignment = cabAssignmentRepository.save(assignment);
 
-            // Apply Night Safety rule (auto re-order or provision escort)
             nightSafetyService.evaluateAndProtect(assignment);
+            assignment = cabAssignmentRepository.save(assignment);
 
+            // Re-validate after night reorder (escort path leaves distances unchanged)
+            maxRideTimeValidator.validateAssignment(assignment, routingProperties.getMaxRideMinutes());
+
+            assignedCount += clusterBookings.size();
             createdAssignmentResponses.add(mapToResponse(assignment));
         }
 
-        log.info("Auto-clustered {} bookings into {} cabs for shift id={} on {}",
-                confirmedBookings.size(), createdAssignmentResponses.size(), shift.getId(), date);
+        meterRegistry.counter("cabpooling.allocations.auto_cluster").increment();
+        meterRegistry.counter("cabpooling.allocations.bookings_assigned").increment(assignedCount);
+
+        log.info("Auto-clustered {}/{} bookings into {} cabs for shift id={} on {}",
+                assignedCount, confirmedBookings.size(), createdAssignmentResponses.size(), shift.getId(), date);
 
         return AutoClusterResponse.builder()
                 .shiftId(shift.getId())
                 .shiftName(shift.getName())
                 .assignmentDate(date)
-                .totalBookingsClustered(confirmedBookings.size())
+                .totalBookingsClustered(assignedCount)
                 .totalCabsAssigned(createdAssignmentResponses.size())
                 .assignments(createdAssignmentResponses)
                 .build();
@@ -160,8 +168,17 @@ public class AllocationService {
                 .toList();
 
         if (!bookings.isEmpty()) {
+            if (bookings.size() > assignment.getCab().getCapacity()) {
+                throw new BusinessRuleException(String.format(
+                        "Seat capacity constraint violated: Cab %s capacity is %d, but %d passengers are assigned",
+                        assignment.getCab().getLicensePlate(), assignment.getCab().getCapacity(), bookings.size()));
+            }
+
             OptimizedRouteResult routeResult = routeOptimizer.optimizeRoute(
                     office, bookings, shift.getShiftType(), distanceProvider);
+
+            maxRideTimeValidator.validateRoute(routeResult, shift.getShiftType(),
+                    routingProperties.getMaxRideMinutes());
 
             applyStopsToAssignment(assignment, routeResult, shift, date);
             assignment.setTotalDistanceKm(routeResult.getTotalDistanceKm());
@@ -169,6 +186,8 @@ public class AllocationService {
             assignment = cabAssignmentRepository.save(assignment);
 
             nightSafetyService.evaluateAndProtect(assignment);
+            assignment = cabAssignmentRepository.save(assignment);
+            maxRideTimeValidator.validateAssignment(assignment, routingProperties.getMaxRideMinutes());
         } else {
             assignment.getStops().clear();
             assignment.setTotalDistanceKm(0.0);
@@ -180,11 +199,25 @@ public class AllocationService {
         return mapToResponse(assignment);
     }
 
+    /**
+     * Geohash-bucketed greedy clustering with capacity and max-cluster-radius (detour) constraints.
+     * Time: O(N · C · B) where B is average bucket size ≪ N — not O(N²) all-pairs.
+     */
     private List<List<Booking>> clusterBookingsByProximity(
             List<Booking> bookings, List<Cab> cabs, Office office) {
 
-        List<List<Booking>> clusters = new ArrayList<>();
+        int precision = routingProperties.getGeohashPrecision();
+        double maxRadiusKm = routingProperties.getMaxClusterRadiusKm();
+
+        Map<String, List<Booking>> buckets = new HashMap<>();
+        for (Booking b : bookings) {
+            String hash = GeohashUtil.encode(b.getPickupLatitude(), b.getPickupLongitude(), precision);
+            buckets.computeIfAbsent(hash, k -> new ArrayList<>()).add(b);
+        }
+
+        Set<Long> assignedIds = new HashSet<>();
         List<Booking> pool = new ArrayList<>(bookings);
+        List<List<Booking>> clusters = new ArrayList<>();
         int cabIndex = 0;
 
         while (!pool.isEmpty() && cabIndex < cabs.size()) {
@@ -192,57 +225,116 @@ public class AllocationService {
             int capacity = cab.getCapacity();
             List<Booking> currentCluster = new ArrayList<>();
 
-            // Find farthest booking from office as seed for this cab
-            Booking seed = pool.get(0);
-            double maxSeedDist = -1.0;
-            for (Booking b : pool) {
-                double d = distanceProvider.calculateDistanceKm(
-                        office.getLatitude(), office.getLongitude(),
-                        b.getPickupLatitude(), b.getPickupLongitude());
-                if (d > maxSeedDist) {
-                    maxSeedDist = d;
-                    seed = b;
-                }
-            }
-
+            Booking seed = selectFarthestFromOffice(pool, office);
             currentCluster.add(seed);
+            assignedIds.add(seed.getId());
             pool.remove(seed);
 
-            // Fill cab with nearest neighbours to current cluster centroid
             while (currentCluster.size() < capacity && !pool.isEmpty()) {
-                Booking lastAdded = currentCluster.get(currentCluster.size() - 1);
-                Booking closest = null;
-                double minDist = Double.MAX_VALUE;
-
-                for (Booking candidate : pool) {
-                    double dist = distanceProvider.calculateDistanceKm(
-                            lastAdded.getPickupLatitude(), lastAdded.getPickupLongitude(),
-                            candidate.getPickupLatitude(), candidate.getPickupLongitude());
-                    if (dist < minDist) {
-                        minDist = dist;
-                        closest = candidate;
-                    }
+                Booking best = findNearestEligibleCandidate(
+                        currentCluster, pool, buckets, precision, maxRadiusKm);
+                if (best == null) {
+                    break; // no nearby rider left without a large detour
                 }
-
-                if (closest != null) {
-                    currentCluster.add(closest);
-                    pool.remove(closest);
-                }
+                currentCluster.add(best);
+                assignedIds.add(best.getId());
+                pool.remove(best);
             }
             clusters.add(currentCluster);
         }
 
-        // Hard Rule: If bookings remain but cabs ran out, log a warning and leave them unassigned.
-        // Never silently overflow extra bookings into the last cluster - that violates seat capacity!
-        if (!pool.isEmpty()) {
-            log.warn("Seat capacity constraint: {} bookings could not be assigned — no available cabs with free seats. " +
-                    "Add more cabs or activate existing fleet cabs.", pool.size());
+        long leftover = bookings.stream().filter(b -> !assignedIds.contains(b.getId())).count();
+        if (leftover > 0) {
+            log.warn("Seat capacity / proximity constraint: {} bookings could not be assigned — "
+                    + "add more cabs or relax cluster radius.", leftover);
         }
 
         return clusters;
     }
 
-    private void applyStopsToAssignment(
+    private Booking selectFarthestFromOffice(List<Booking> pool, Office office) {
+        Booking seed = pool.get(0);
+        double maxSeedDist = -1.0;
+        for (Booking b : pool) {
+            double d = distanceProvider.calculateDistanceKm(
+                    office.getLatitude(), office.getLongitude(),
+                    b.getPickupLatitude(), b.getPickupLongitude());
+            if (d > maxSeedDist) {
+                maxSeedDist = d;
+                seed = b;
+            }
+        }
+        return seed;
+    }
+
+    private Booking findNearestEligibleCandidate(
+            List<Booking> cluster,
+            List<Booking> pool,
+            Map<String, List<Booking>> buckets,
+            int precision,
+            double maxRadiusKm) {
+
+        Booking seed = cluster.get(0);
+        Booking lastAdded = cluster.get(cluster.size() - 1);
+
+        // Spatial index: only inspect bookings in the seed's geohash neighbourhood
+        Set<Long> candidateIds = new HashSet<>();
+        for (String cell : GeohashUtil.encodeWithNeighbors(
+                seed.getPickupLatitude(), seed.getPickupLongitude(), precision)) {
+            List<Booking> cellBookings = buckets.get(cell);
+            if (cellBookings != null) {
+                for (Booking b : cellBookings) {
+                    candidateIds.add(b.getId());
+                }
+            }
+        }
+
+        Booking closest = null;
+        double minDist = Double.MAX_VALUE;
+
+        for (Booking candidate : pool) {
+            if (!candidateIds.contains(candidate.getId())) {
+                continue;
+            }
+            double distFromSeed = distanceProvider.calculateDistanceKm(
+                    seed.getPickupLatitude(), seed.getPickupLongitude(),
+                    candidate.getPickupLatitude(), candidate.getPickupLongitude());
+            if (distFromSeed > maxRadiusKm) {
+                continue; // keep detours small — never mix far-apart areas
+            }
+            double distFromLast = distanceProvider.calculateDistanceKm(
+                    lastAdded.getPickupLatitude(), lastAdded.getPickupLongitude(),
+                    candidate.getPickupLatitude(), candidate.getPickupLongitude());
+            if (distFromLast < minDist) {
+                minDist = distFromLast;
+                closest = candidate;
+            }
+        }
+
+        // Fallback: if geohash neighbourhood yielded nothing but pool still has nearby riders
+        // (edge of cell), scan pool once with radius filter only
+        if (closest == null) {
+            for (Booking candidate : pool) {
+                double distFromSeed = distanceProvider.calculateDistanceKm(
+                        seed.getPickupLatitude(), seed.getPickupLongitude(),
+                        candidate.getPickupLatitude(), candidate.getPickupLongitude());
+                if (distFromSeed > maxRadiusKm) {
+                    continue;
+                }
+                double distFromLast = distanceProvider.calculateDistanceKm(
+                        lastAdded.getPickupLatitude(), lastAdded.getPickupLongitude(),
+                        candidate.getPickupLatitude(), candidate.getPickupLongitude());
+                if (distFromLast < minDist) {
+                    minDist = distFromLast;
+                    closest = candidate;
+                }
+            }
+        }
+
+        return closest;
+    }
+
+    void applyStopsToAssignment(
             CabAssignment assignment,
             OptimizedRouteResult routeResult,
             Shift shift,
@@ -262,7 +354,7 @@ public class AllocationService {
                 }
                 plannedTimes[i] = current;
             }
-            if (optStops.size() > 0) {
+            if (!optStops.isEmpty()) {
                 plannedTimes[optStops.size() - 1] = officeArrival;
             }
         } else {
@@ -311,7 +403,7 @@ public class AllocationService {
         }
     }
 
-    private CabAssignmentResponse mapToResponse(CabAssignment assignment) {
+    CabAssignmentResponse mapToResponse(CabAssignment assignment) {
         List<PickupStopResponse> stopResponses = assignment.getStops() != null
                 ? assignment.getStops().stream().map(this::mapStopToResponse).toList()
                 : List.of();

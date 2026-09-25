@@ -40,7 +40,8 @@ public class SecurityConfig {
                 // Public endpoints
                 .requestMatchers("/api/auth/**").permitAll()
                 .requestMatchers("/api/test/public").permitAll()
-                .requestMatchers("/actuator/**", "/api/actuator/**").permitAll()
+                .requestMatchers("/actuator/health", "/actuator/info", "/api/actuator/health", "/api/actuator/info").permitAll()
+                .requestMatchers("/actuator/**", "/api/actuator/**").hasAuthority("ROLE_ADMIN")
                 // Admin-only endpoints
                 .requestMatchers("/api/admin/**").hasAuthority("ROLE_ADMIN")
                 .requestMatchers("/api/test/admin-only").hasAuthority("ROLE_ADMIN")
